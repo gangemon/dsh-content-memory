@@ -89,10 +89,10 @@ export const Config = z.object({
     .string()
     .default(
       '上下文占用约 {pct}%（约 {tokens} token），已过 {threshold}% 阈值：旧内容在稀释注意力、挤占任务窗口，'
-        + '压缩是把过时上下文折叠成摘要、腾出空间给当前任务。下面是当前 surface 的完整节点清单，'
-        + '压哪一段、压多少由你判断。',
+        + '压缩是把过时上下文折叠成摘要、腾出空间给当前任务。'
+        + '凭你自己的对话上下文判断压哪一段、压多少。',
     )
-    .description('阈值触发时注入给模型的提示词（开场白）；占位符：{pct} {tokens} {threshold} {tool}。插件会在其后固定追加方法性的「压多少」行与完整节点清单，不会预切可压区间'),
+    .description('阈值触发时注入给模型的提示词（开场白）；占位符：{pct} {tokens} {threshold} {tool}。插件会在其后固定追加「压多少」与 from/to 写法说明，不注入节点清单、不预切可压区间'),
   contextWindowTokens: z
     .number()
     .default(80000)
@@ -419,7 +419,7 @@ function locateFailure(session, label, kind, hits, poolSize, context) {
       + '（已排除会被重新注入的上下文，以及最近的自有工具调用记录）。\n'
       + '字面量匹配是子串，空白/换行/行号前缀/全角差异都已自动容忍，不需要转义。\n'
       + '可执行的动作：\n'
-      + '  1) 用 scan_context 看清真实节点，再从它的开头 12–24 字取片段（别抄注入清单里的预览）；\n'
+      + '  1) 从你记得的原文里取 12–24 个字的片段（节点开头最稳，别用太短的常见短语）；\n'
       + '  2) 片段不要跨越节点边界，要落在同一个节点内部；\n'
       + '  3) 避开之前定位失败说明里出现过的短语——那些短语现在同时存在于多个节点里；\n'
       + '  4) 若这一端本来就不该由内容定位，试另一端的唯一片段，再取它附近的平衡切点。',
@@ -448,13 +448,13 @@ function locateFailure(session, label, kind, hits, poolSize, context) {
     ? `这些候选的「可抄锚点」互相重复（开头都在「${firstHead.slice(0, 40)}${firstHead.length > 40 ? '…' : ''}」之内），照抄也分不出它们。\n`
       + '可执行的动作：\n'
       + '  1) 从节点内部的独有内容取片段：不同的路径、不同的报错原文、不同的参数值；\n'
-      + '  2) 或先 scan_context 看清这些序号各是什么，再从它们的差异处取锚；\n'
+      + '  2) 换成你记得的、更独特的原文片段（不同的路径、报错原文、参数值）；\n'
       + '  3) 若这一端本来就不该由内容定位，只给另一端（唯一的那端），让这一端由区间推断。'
     : '可执行的动作：\n'
       + '  1) 直接照抄上面某个「可抄锚点」（已经是 re:^ 开头锚定的，最稳）；\n'
       + '  2) 或把片段加长到足以唯一；\n'
       + '  3) 若其中一条明显是助手自己在回复里复述的（会被标成 assistant/message），别选它；\n'
-      + '  4) 用 scan_context 看清这些序号分别是什么，再从那里取片段。';
+      + '  4) 回忆你对话里这几处究竟对应什么内容，从你记得的差异处取片段。';
   return new Error(
     `定位失败：${head} 命中了 ${hits.length} 个节点${scope}，无法确定唯一位置。`
     + '压缩是破坏性操作，不会自动挑其中一个。\n'
@@ -1021,8 +1021,9 @@ function measurePressure(meter, session, cfg) {
 }
 
 /**
- * 注入/面板共用的提示文本：模板 + 方法性的「压多少」+ 完整节点清单。
- * 不给预切的 [start, end] 区间——可压性是策略判断，不是硬编码规则；
+ * 注入/面板共用的提示文本：模板 + 「压多少」+ from/to 写法。
+ * 不给节点清单、不给预切区间：压哪段由模型凭自己的对话上下文判断，
+ * 定位片段从自己记得的原文里取（记住的原文开头就是节点开头）。
  * 模板里的 {pct} {tokens} {threshold} 由调用方传入，未传则保留原样。
  */
 function buildHintText(session, cfg, meter, pct, tokens, threshold) {
@@ -1030,48 +1031,10 @@ function buildHintText(session, cfg, meter, pct, tokens, threshold) {
     .replaceAll('{pct}', pct === null || pct === undefined ? '{pct}' : String(pct))
     .replaceAll('{tokens}', tokens === null || tokens === undefined ? '{tokens}' : String(tokens))
     .replaceAll('{threshold}', threshold === null || threshold === undefined ? '{threshold}' : String(threshold));
-  let measured = [];
-  try {
-    measured = measureNodes(meter, session);
-  } catch {
-    measured = [];
-  }
-  const totalTokens = measured.reduce((sum, node) => sum + (node.tokens ?? 0), 0);
-  const keepFrom = Math.max(0, measured.length - Math.max(0, cfg.keepTailNodes));
-  const KIND_ABBR = {
-    'user/message': 'u',
-    'assistant/message': 'a',
-    'tool/result': 't',
-    'system/message': 's',
-    'developer/message': 'd',
-  };
-  const preview = (seq) => {
-    try {
-      return previewOf(session, seq).replace(/\s+/g, ' ').slice(0, 24);
-    } catch {
-      return '';
-    }
-  };
-  const atoms = measured.map(
-    (node, index) =>
-      `${KIND_ABBR[node.kind] ?? '?'}${node.tokens ?? 0}${index >= keepFrom ? '!' : ''} ${preview(node.seq)}`,
-  );
-  const rows = [];
-  let line = '';
-  for (const atom of atoms) {
-    if (line.length + atom.length + 1 > 150) {
-      rows.push(line);
-      line = atom;
-    } else {
-      line = line.length === 0 ? atom : `${line} ${atom}`;
-    }
-  }
-  if (line.length > 0) rows.push(line);
   return [
     template,
-    `压多少：先看节点清单里的 token 分布，挑最旧、最大、已被后续信息取代的连续段；同一主题能一次压掉的别拆成多次小折；压完看占用，仍在阈值之上就继续下一段，回到阈值下方就停——不必追求某个固定比例。优先压：大块 tool 输出（源码、目录树、长日志）、已完成任务的探索与试错、重复确认；必须留：当前任务的决定、文件路径、命令、报错原文、用户明确要求。`,
-    `节点清单（类型/token + 内容开头；u=user a=assistant t=tool/result s=system d=developer；! =尾部保留）：共 ${measured.length} 个，合计约 ${totalTokens} token。压哪一段、压多少由你判断：挑最旧、最大、已被后续信息取代的连续区间，按内容里独特的一段写 from/to。三种写法按可靠度：①开头锚定（首选）re:^\\s*<清单里的真实开头 12–24 字>{12,}——节点开头=原文，注入清单与助手复述的副本都在行中间，锚定后不误命中；②前后缀夹逼 re:^<前缀>[\\s\\S]{12,60}<后缀>，唯一性由前后缀共同保证；③字段级：拿报错原文里的编号/路径/命令参数当锚。反例：re:^The file 太短（多份同名报告同以此开头）、re:^.*index.* 贪心、抄下面的预览前缀（那是截断前缀不是原文开头）；字面文本给 12–24 个连续字也能用（不用转义，空白/全角/行号差异自动容忍）。别选「上下文占用约…」这类注入提示节点（会被重新注入）。两端若落在工具步中间会自动收敛到最近的安全切点；同一主题能一次压掉的别拆成多次小折，多段用 segments 一次压掉。`,
-    ...rows,
+    `压多少：凭你自己的对话上下文判断，挑最旧、最大、已被后续信息取代的连续段；同一主题能一次压掉的别拆成多次小折；压完看占用，仍在阈值之上就继续下一段，回到阈值下方就停——不必追求某个固定比例。优先压：大块 tool 输出（源码、目录树、长日志）、已完成任务的探索与试错、重复确认；必须留：当前任务的决定、文件路径、命令、报错原文、用户明确要求。`,
+    `定位：不用节点清单，from/to 直接从你记得的原文里取片段。写法按可靠度三选一（记不住就照抄工具描述里的模板）：①开头锚定（首选）re:^\\s*<某节点真实的开头 12–24 字>{12,}——节点开头=原文，别处的复述都在行中间，锚定后不误命中；②前后缀夹逼 re:^<前缀>[\\s\\S]{12,60}<后缀>，唯一性由前后缀共同保证；③字段级：拿报错原文里的编号/路径/命令参数当锚。别写给所有节点都成立的短片段，别用 re:^.* 贪心。两端若落在工具步中间会自动收敛到最近的安全切点；多段用 segments 数组一次压掉。`,
   ].join('\n');
 }
 
@@ -1373,17 +1336,17 @@ export function apply(ctx, config) {
     description:
       '把 surface 上的一段或几段区间各替换成一个检查点：你写的 summary 就是该段替换后保留的全部内容，被替换的节点从此不再进入上下文。' +
       '单段用 from/to/summary 按内容定位；多段用 segments: [{from, to, summary}, …]，一次调用把多段一起折掉，不用反复调用。' +
-      '定位片段三种写法，按可靠度排序（都要唯一命中一端节点）：\n' +
-      '①开头锚定（首选）：re:^\\s*<节点开头的 12–24 个字>{12,}——节点开头就是原文，注入清单与助手复述的副本都在行中间，锚定后不会误命中。反例 re:^The file（多份同名报告同以此开头，必多命中）；正例 re:^\\s*The file E:\\\\Ai\\\\退注意力\\\\packages\\\\dsh-context-compact\\\\lib\\\\index\\.js has been updated。\n' +
+      '定位片段三种写法，按可靠度排序（都要唯一命中一端节点；不用节点清单，从你自己的对话记忆里取片段）：\n' +
+      '①开头锚定（首选）：re:^\\s*<节点开头的 12–24 个字>{12,}——节点开头就是原文，别处的复述都在行中间，锚定后不会误命中。反例 re:^The file（多份同名报告同以此开头，必多命中）；正例 re:^\\s*The file E:\\\\Ai\\\\退注意力\\\\packages\\\\dsh-context-compact\\\\lib\\\\index\\.js has been updated。\n' +
       '②前后缀夹逼：re:^<前缀>[\\s\\S]{12,60}<后缀>，唯一性由前后缀共同保证，中间用 [\\s\\S]{12,60} 吸收正文。反例 re:^.*index\\.js.*updated（.* 跨节点贪心）；正例 re:^\\s*<path>[^\\n]{0,90}index\\.js</path>\\s*<type>file</type>。\n' +
       '③字段级：拿报错编号、路径、命令参数当锚，比整句稳——re:^\\s*Error: 定位失败：from。\n' +
-      '不带 re: 时按字面文本匹配：给 12–24 个连续字符，不用转义，空白/换行/全角/行号前缀差异自动容忍；但别抄注入清单里的预览（那是截断前缀，不是原文开头），从 scan_context 或清单标出的真实开头取。字面文本若落在唯一节点开头会优先选它；host 会把原文与折叠成一行去行号的文本各试一次，只是兜底别依赖。多命中会报错并列候选，不自动选。' +
+      '不带 re: 时按字面文本匹配：给 12–24 个连续字符，不用转义，空白/换行/全角/行号前缀差异自动容忍；片段来自你记得的原文，不用按预览逐字抄。字面文本若落在唯一节点开头会优先选它；host 会把原文与折叠成一行去行号的文本各试一次，只是兜底别依赖。多命中会报错并列候选，不自动选。' +
       '规则：①每段两端必须是平衡边界；②摘要必须明显短于被替换内容；③区间里可以包含之前生成的检查点（可以再次压缩）；' +
       '④当前轮次也可以压缩（只要区间结束于一个已闭合的步骤）；⑤压缩后你自己的摘要不能引用被删掉的原话，只保留结论、路径、命令与失败现场。',
     parameters: {
       type: 'object',
       properties: {
-        from: { type: 'string', description: '单段模式：定位起点节点。首选 re:^\\s*<节点开头 12–24 字>{12,}（锚定原文开头，注入清单/助手复述的副本不误命中）；或 re:^<前缀>[\\s\\S]{12,60}<后缀>（前后缀夹逼）；或 12–24 个连续字面字符（不用转义，空白/全角/行号差异自动容忍，落在唯一节点开头会优先选）。反例：re:^The file 太短必多命中、.*index.* 跨节点贪心、抄注入清单预览（截断前缀非原文开头）。多命中报错并列候选，不自动选' },
+        from: { type: 'string', description: '单段模式：定位起点节点。首选 re:^\\s*<你记得的节点开头 12–24 字>{12,}（锚定原文开头，别处复述不误命中）；或 re:^<前缀>[\\s\\S]{12,60}<后缀>（前后缀夹逼）；或 12–24 个连续字面字符（不用转义，空白/全角/行号差异自动容忍，落在唯一节点开头会优先选）。反例：re:^The file 太短必多命中、.*index.* 跨节点贪心、给所有节点都成立的短片段。多命中报错并列候选，不自动选' },
         to: { type: 'string', description: '单段模式：定位终点节点，只在 from 命中的节点之后查找。写法同 from，须在 from 之后唯一命中；若命中只出现在 from 之前会提示写反' },
         summary: { type: 'string', description: '单段模式：检查点正文，替代被压缩区间的全部内容' },
         segments: {
@@ -2147,12 +2110,11 @@ export function apply(ctx, config) {
           const tail = rawTail.slice(0, 40);
           instruction =
             `【上下文面板】请用 ${cfg.toolName} 折叠 surface 上「${head}」到「${tail}」这段区间：`
-            + `先用 ${cfg.scanToolName} 核对两端节点，再用 from/to 定位（不用转义，按字面文本匹配：from: "${head}"、to: "${tail}"；`
-            + '命中多个节点或找不到时，按报错里列出的候选换一段更独特的文本）。'
+            + `用 from/to 按字面文本定位（不用转义：from: "${head}"、to: "${tail}"；片段取自你记得的原文，命中多个或找不到时按报错里列出的候选换一段更独特的文本）。`
             + `然后写一份只保留结论、路径、命令与失败现场的摘要（语言：${cfg.summaryLanguage}；写法：${cfg.summaryStyle}）。`
             + '这只是腾地方，不要在这条消息后继续别的任务。';
         } else {
-          // 不给预切区间：完整节点清单一并给，压哪段、压多少由模型自己判断
+          // 不给预切区间、不给节点清单：压哪段、压多少由模型凭自己的上下文判断
           // （与注入节点用的是同一套文本，面板里看到的和模型收到的一致）。
           try {
             const pressure = measurePressure(meterOf(), session, cfg);
@@ -2242,7 +2204,7 @@ export function apply(ctx, config) {
   const baseRules = [
     '上下文越长，旧内容越稀释注意力；压缩把过时对话折叠成摘要，腾出窗口给当前任务。',
     '压缩哪些：已被后续信息取代、与当前任务无关的早期探索与试错、重复确认；保留当前任务的决定、文件路径、命令、失败现场和用户明确要求。',
-    `用 ${cfg.toolName}：下面会给出完整节点清单（类型/token + 内容开头）。from/to 写法按可靠度三选一（记不住就照抄工具描述里的模板）：①开头锚定（首选）re:^\\s*<清单里的真实开头 12–24 字>{12,}，节点开头=原文、副本都在行中间；②前后缀夹逼 re:^<前缀>[\\s\\S]{12,60}<后缀>；③字段级：拿报错原文里的编号/路径当锚。别抄清单预览前缀（那是截断前缀不是原文开头），别用 re:^.* 贪心。两端若落在工具步中间会自动收敛到最近的安全切点（只会少压，不会劈开步骤）；多段用 segments 数组（同一主题能一次压掉就别拆成多次；单次段数上限、每段节点上限、最小收益门槛见工具描述，超限会被拒绝）；尾部 ${cfg.keepTailNodes} 条保留。`,
+    `用 ${cfg.toolName}：不注入节点清单，压哪一段凭你自己的对话上下文判断。from/to 写法按可靠度三选一（记不住就照抄工具描述里的模板）：①开头锚定（首选）re:^\\s*<你记得的某个节点真实开头 12–24 字>{12,}，节点开头=原文、别处复述都在行中间；②前后缀夹逼 re:^<前缀>[\\s\\S]{12,60}<后缀>；③字段级：拿报错原文里的编号/路径当锚。别写给所有节点都成立的短片段，别用 re:^.* 贪心。两端若落在工具步中间会自动收敛到最近的安全切点（只会少压，不会劈开步骤）；多段用 segments 数组（同一主题能一次压掉就别拆成多次；单次段数上限、每段节点上限、最小收益门槛见工具描述，超限会被拒绝）；尾部 ${cfg.keepTailNodes} 条保留。`,
     `${cfg.requireShrink ? '摘要必须明显短于被替换内容；' : ''}摘要语言：${cfg.summaryLanguage}；写法：${cfg.summaryStyle}。压缩后只看得到摘要：路径、命令、失败现场必须写进摘要。`,
     cfg.extraRules ? `额外硬规则：${cfg.extraRules}` : '',
   ].filter((line) => line.length > 0);
