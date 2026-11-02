@@ -252,6 +252,82 @@ function normalizeMatchText(text) {
   return String(text ?? '').replace(/\s+/g, ' ').trim();
 }
 
+/** 去掉工具输出里的行号前缀（`1682: `、`12| `），保留其余内容。 */
+function stripLineNumberPrefix(text) {
+  return text.replace(/(^|\n)[ \t]*\d+[:|][ \t]?/g, '$1');
+}
+
+/**
+ * 定位匹配的归一化阶梯：**严格级在先，只有在更严格的级一个都没命中时才降级**。
+ * 这样模型从上一条注入清单的预览里抄片段（空白被压平）、或从源码里抄带行号的
+ * 一行、或用了全角标点，都能命中；而正常书写时仍走最严格的一级，
+ * 不会因为宽松规则把无关节点也命中。
+ *
+ * 每一级都提供 `test`（包含）与 `atStart`（节点开头命中）两个判定，
+ * 后者用来识别「这段内容就是该节点的开头」——复述副本永远不在开头。
+ */
+function matchNormalizations() {
+  return [
+    {
+      name: '原样（空白折叠）',
+      build: (needle) => {
+        const want = normalizeMatchText(needle);
+        return {
+          test: (raw) => normalizeMatchText(raw).includes(want),
+          atStart: (raw) => normalizeMatchText(raw).startsWith(want),
+        };
+      },
+    },
+    {
+      name: '忽略所有空白',
+      build: (needle) => {
+        const want = String(needle).replace(/\s+/g, '');
+        return {
+          test: (raw) => String(raw).replace(/\s+/g, '').includes(want),
+          atStart: (raw) => String(raw).replace(/\s+/g, '').startsWith(want),
+        };
+      },
+    },
+    {
+      name: '忽略行号前缀与空白',
+      build: (needle) => {
+        const want = stripLineNumberPrefix(String(needle)).replace(/\s+/g, '');
+        return {
+          test: (raw) => stripLineNumberPrefix(String(raw)).replace(/\s+/g, '').includes(want),
+          atStart: (raw) => stripLineNumberPrefix(String(raw)).replace(/\s+/g, '').startsWith(want),
+        };
+      },
+    },
+    {
+      name: '忽略全角半角与空白',
+      build: (needle) => {
+        const want = String(needle).normalize('NFKC').replace(/\s+/g, '');
+        return {
+          test: (raw) => String(raw).normalize('NFKC').replace(/\s+/g, '').includes(want),
+          atStart: (raw) => String(raw).normalize('NFKC').replace(/\s+/g, '').startsWith(want),
+        };
+      },
+    },
+  ];
+}
+
+/**
+ * 给某个节点生成「可以直接照抄」的定位片段：取它真实开头的第一行前 24 字，
+ * 正则转义后加 `re:^`。只在定位失败的报错里给，把「猜锚」换成「抄锚」。
+ */
+function suggestAnchor(session, seq, maxLen = 24) {
+  let raw = '';
+  try {
+    raw = fullTextOf(session, seq);
+  } catch {
+    return '';
+  }
+  const firstLine = String(raw).split('\n').map((line) => line.trim()).find((line) => line.length > 0);
+  if (firstLine === undefined) return '';
+  const head = firstLine.slice(0, maxLen);
+  return `re:^${head.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`;
+}
+
 /**
  * 定位匹配池要跳过的节点（全部按事件元数据识别，不按内容识别）：
  *  1) 全部可再生注入节点——它们内嵌当时的节点清单，清单前缀就是节点开头；
@@ -318,30 +394,50 @@ function nodeFingerprint(session, seq) {
   return `#${seq} [${kind}] 约 ${tokens} token`;
 }
 
-/** 定位失败的统一出口：只报结构信息与可执行动作，绝不回显 from/to 原文。 */
-function locateFailure(session, label, kind, hits, poolSize) {
+/**
+ * 定位失败的统一出口：只报结构指纹与可执行动作。
+ *
+ * 契约提醒：报错里**不会回显你写的 from/to**，但会给出候选节点各自的
+ * `re:^` 锚点——那是节点原文的开头，锚定后即使这段文字在别处被复述过，
+ * 也不会再造成二次命中。
+ */
+function locateFailure(session, label, kind, hits, poolSize, context) {
+  const ctx = context ?? {};
   const head = label === 'from'
     ? 'from（区间起点）'
     : 'to（区间终点，只在 from 命中的节点之后查找）';
   if (kind === 'miss') {
+    const tried = Array.isArray(ctx.triedLevels) && ctx.triedLevels.length > 0
+      ? `已按「${ctx.triedLevels.join(' → ')}」逐级放宽，都没有命中。`
+      : '';
     return new Error(
       `定位失败：${head} 没有匹配到任何节点。`
-      + `匹配是字面量（空白已折叠，不需要转义），当前可匹配节点 ${poolSize} 个`
+      + `${tried}当前可匹配节点 ${poolSize} 个`
       + '（已排除会被重新注入的上下文，以及最近的自有工具调用记录）。\n'
-      + '请换一段更独特的文本再试：取该节点开头 20–40 字之后的内容，'
-      + '并避开之前定位失败说明里出现过的短语（那些短语现在同时存在于多个节点里）。',
+      + '匹配是字面量子串，空白/换行/行号前缀/全角差异都已自动容忍，不需要转义。\n'
+      + '可执行的动作：\n'
+      + '  1) 用 scan_context 看清真实节点，再从它的开头 12–24 字取片段（别抄注入清单里的预览）；\n'
+      + '  2) 片段不要跨越节点边界，要落在同一个节点内部；\n'
+      + '  3) 避开之前定位失败说明里出现过的短语——那些短语现在同时存在于多个节点里；\n'
+      + '  4) 若这一端本来就不该由内容定位，试另一端的唯一片段，再取它附近的平衡切点。',
     );
   }
-  const listed = hits.slice(0, 5).map((seq) => `  ${nodeFingerprint(session, seq)}`).join('\n');
+  const listed = hits.slice(0, 5).map((seq) => {
+    const anchor = suggestAnchor(session, seq);
+    return `  ${nodeFingerprint(session, seq)}${anchor ? `\n      可抄锚点 ${anchor}` : ''}`;
+  }).join('\n');
+  const scope = ctx.atStartOnly
+    ? `（只统计「片段出现在该节点开头」的命中${ctx.allHitCount > hits.length ? `；包含片段的节点另有 ${ctx.allHitCount - hits.length} 个，是别处的复述` : ''}）`
+    : '';
   return new Error(
-    `定位失败：${head} 命中了 ${hits.length} 个节点，无法确定唯一位置。`
-    + '压缩是破坏性操作，不会自动挑其中一个，请自己缩小范围。\n'
+    `定位失败：${head} 命中了 ${hits.length} 个节点${scope}，无法确定唯一位置。`
+    + '压缩是破坏性操作，不会自动挑其中一个。\n'
     + `${listed}${hits.length > 5 ? `\n  …另有 ${hits.length - 5} 个` : ''}\n`
     + '可执行的动作：\n'
-    + '  1) 把片段加长到足以唯一；\n'
-    + '  2) 改用节点内更靠后的独特文本（开头往往在多条消息里重复）；\n'
-    + '  3) 用 scan_context 看清这些序号分别是什么，再从那里取片段；\n'
-    + '  4) 如果另一端是唯一的，先定位另一端，再取它之前最近的平衡切点作这一端。',
+    + '  1) 直接照抄上面某个「可抄锚点」（已经是 re:^ 开头锚定的，最稳）；\n'
+    + '  2) 或把片段加长到足以唯一；\n'
+    + '  3) 若其中一条明显是助手自己在回复里复述的（会被标成 assistant/message），别选它；\n'
+    + '  4) 用 scan_context 看清这些序号分别是什么，再从那里取片段。',
   );
 }
 
@@ -359,50 +455,108 @@ function resolveLocate(session, from, to, options) {
   const excluded = opts.excluded instanceof Set
     ? opts.excluded
     : locateExcludedSeqs(session, opts.toolName);
+  // 定位过程中的说明（降级匹配、开头优先），会并进结果的 warning。
+  const notes = [];
+  const readRawText = (seq) => {
+    try {
+      return fullTextOf(session, seq) ?? '';
+    } catch {
+      return '';
+    }
+  };
   const matcherOf = (pattern, label) => {
     if (typeof pattern !== 'string' || pattern.trim().length === 0) {
-      throw new Error(`${label} 不能为空：给一段能匹配该端节点内容开头/中间的字面文本（空白会被折叠，不需要转义）`);
+      throw new Error(`${label} 不能为空：给一段能匹配该端节点开头/中间的字面文本（空白、行号前缀差异会被自动容忍，不需要转义）`);
     }
     const useRegex = pattern.startsWith('re:');
     const source = useRegex ? pattern.slice(3) : pattern;
     if (useRegex) {
+      // 显式写了正则就只走这一级：用户要的语义不该被自动放宽。
       let re;
+      let anchored;
       try {
         re = new RegExp(source, 'i');
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         throw new Error(`${label} 的 re: 正则无效：${JSON.stringify(source)}（${reason}）；也可以去掉 re: 直接给字面文本`);
       }
-      return (text) => re.test(text);
-    }
-    const needle = normalizeMatchText(source);
-    return (text) => text.includes(needle);
-  };
-  const findAll = (test, beginIndex, label) => {
-    const hits = [];
-    for (let i = beginIndex; i < nodes.length; i += 1) {
-      if (excluded.has(nodes[i])) continue;
-      let text = '';
       try {
-        text = normalizeMatchText(fullTextOf(session, nodes[i]));
+        anchored = new RegExp(`^(?:${source})`, 'i');
       } catch {
-        text = '';
+        anchored = re;
       }
-      if (text && test(text)) hits.push(nodes[i]);
+      return {
+        label,
+        levels: [{ name: 're:', test: (raw) => re.test(raw), atStart: (raw) => anchored.test(raw) }],
+      };
     }
-    if (hits.length === 0) {
-      throw locateFailure(session, label, 'miss', [], nodes.length - excluded.size);
-    }
-    if (hits.length > 1) {
-      throw locateFailure(session, label, 'ambiguous', hits, nodes.length - excluded.size);
-    }
-    return hits[0];
+    return {
+      label,
+      levels: matchNormalizations().map((level) => {
+        const api = level.build(source);
+        return { name: level.name, test: api.test, atStart: api.atStart };
+      }),
+    };
   };
-  const testFrom = matcherOf(from, 'from');
-  const testTo = matcherOf(to, 'to');
-  const start = findAll(testFrom, 0, 'from');
-  const end = findAll(testTo, nodes.indexOf(start), 'to');
-  return { start, end, testFrom, testTo, excluded };
+
+  /**
+   * 在一端找一个节点：由严到宽逐级匹配，第一级有命中的就用它。
+   * 命中集里再按「片段是否落在节点开头」分层——复述副本永远在行中间，
+   * 所以只有一个节点在开头命中时，那就是原文。多个仍报错，不猜。
+   */
+  const findEndpoint = (matcher, beginIndex) => {
+    const tried = [];
+    for (let li = 0; li < matcher.levels.length; li += 1) {
+      const level = matcher.levels[li];
+      const all = [];
+      const atStart = [];
+      for (let i = beginIndex; i < nodes.length; i += 1) {
+        const seq = nodes[i];
+        if (excluded.has(seq)) continue;
+        const raw = readRawText(seq);
+        if (!raw || !level.test(raw)) continue;
+        all.push(seq);
+        if (level.atStart(raw)) atStart.push(seq);
+      }
+      if (all.length === 0) {
+        tried.push(level.name);
+        continue;
+      }
+      const pool = atStart.length > 0 ? atStart : all;
+      if (pool.length === 1) {
+        if (li > 0) {
+          notes.push(`${matcher.label} 在「${level.name}」这一级才匹配到 #${pool[0]}：原文与片段存在空白/行号/全角差异，已自动容忍`);
+        }
+        if (atStart.length === 1 && all.length > 1) {
+          notes.push(`${matcher.label} 共含于 ${all.length} 个节点，只有 #${pool[0]} 的开头与片段一致（其余是别处的复述），已选它；写 re:^ 可省掉这条提示`);
+        }
+        return { seq: pool[0], levelIndex: li };
+      }
+      throw locateFailure(session, matcher.label, 'ambiguous', pool, nodes.length - excluded.size, {
+        levelName: level.name,
+        atStartOnly: atStart.length > 0,
+        allHitCount: all.length,
+      });
+    }
+    throw locateFailure(session, matcher.label, 'miss', [], nodes.length - excluded.size, {
+      triedLevels: tried,
+    });
+  };
+
+  const matcherFrom = matcherOf(from, 'from');
+  const matcherTo = matcherOf(to, 'to');
+  const startHit = findEndpoint(matcherFrom, 0);
+  const endHit = findEndpoint(matcherTo, nodes.indexOf(startHit.seq));
+  return {
+    start: startHit.seq,
+    end: endHit.seq,
+    matcherFrom,
+    matcherTo,
+    fromLevel: startHit.levelIndex,
+    toLevel: endHit.levelIndex,
+    excluded,
+    notes,
+  };
 }
 
 /**
@@ -462,18 +616,25 @@ function assertSpanUnambiguous(session, span, located) {
   const nodes = session.surface.nodes;
   // 注入容器里嵌着节点清单，区间内可能有它；复检时跳过，否则会误判「片段太宽泛」。
   const skip = located.excluded instanceof Set ? located.excluded : new Set();
-  for (const [label, test] of [['from', located.testFrom], ['to', located.testTo]]) {
+  // 用定位当时实际生效的那一级复检：定位降级到「忽略空白」时，复检也该按同一口径，
+  // 否则会用一个更严的级判出「0 命中」，把已经正确的区间误报成太宽泛。
+  const levelOf = (matcher, index) => matcher.levels[Math.min(index ?? 0, matcher.levels.length - 1)];
+  const checks = [
+    ['from', levelOf(located.matcherFrom, located.fromLevel)],
+    ['to', levelOf(located.matcherTo, located.toLevel)],
+  ];
+  for (const [label, level] of checks) {
     let hits = 0;
     for (let i = span.startIdx; i <= span.endIdx; i += 1) {
       const seq = nodes[i];
       if (skip.has(seq)) continue;
       let text = '';
       try {
-        text = normalizeMatchText(fullTextOf(session, seq));
+        text = fullTextOf(session, seq) ?? '';
       } catch {
         text = '';
       }
-      if (text && test(text)) hits += 1;
+      if (text && level.test(text)) hits += 1;
     }
     if (hits > 1) {
       throw new Error(
@@ -491,6 +652,8 @@ function assertSpanUnambiguous(session, span, located) {
 function locateSpan(session, from, to, options) {
   const located = resolveLocate(session, from, to, options);
   const span = convergeSpan(session, located.start, located.end);
+  // 定位阶段的说明（自动降级、开头优先）同样要进 warning，别悄悄发生。
+  span.notes = [...(located.notes ?? []), ...(span.notes ?? [])];
   assertSpanUnambiguous(session, span, located);
   return span;
 }
@@ -1149,14 +1312,14 @@ export function apply(ctx, config) {
     description:
       '把 surface 上的一段或几段区间各替换成一个检查点：你写的 summary 就是该段替换后保留的全部内容，被替换的节点从此不再进入上下文。' +
       '单段用 from/to/summary 按内容定位；多段用 segments: [{from, to, summary}, …]，一次调用把多段一起折掉，不用反复调用。' +
-      'from 匹配起点节点全文、to 匹配终点节点全文，给一段能唯一命中该节点的独特文本即可（文件名、命令、报错原文）；默认按字面量匹配（空白折叠），不需要转义；要用正则则写 re: 前缀。' +
+      'from 匹配起点节点全文、to 匹配终点节点全文，给一段能唯一命中该节点的独特文本即可（文件名、命令、报错原文）；字面量匹配不需要转义，空白/换行/行号前缀/全角半角差异会被自动容忍（由严到宽逐级放宽，只有上一级零命中才降级）；并且若片段恰好落在唯一一个节点的开头，会优先选它（复述副本永不在开头），该判断会写进 warning。要用正则则写 re: 前缀。' +
       '规则：①每段两端必须是平衡边界；②摘要必须明显短于被替换内容；③区间里可以包含之前生成的检查点（可以再次压缩）；' +
       '④当前轮次也可以压缩（只要区间结束于一个已闭合的步骤）；⑤压缩后你自己的摘要不能引用被删掉的原话，只保留结论、路径、命令与失败现场。',
     parameters: {
       type: 'object',
       properties: {
-        from: { type: 'string', description: '单段模式：定位起点节点。首选正则 re:^片段 锚定节点开头（注入清单与助手复述的副本都落在行中间，锚定后不会误命中）；也可用字面文本（空白折叠），如 某文件路径片段。须唯一命中' },
-        to: { type: 'string', description: '单段模式：定位终点节点，只在 from 命中的节点之后查找。首选 re:^片段 锚定节点开头；也可用字面文本。须唯一命中' },
+        from: { type: 'string', description: '单段模式：定位起点节点。写一段能唯一命中该节点内容的话即可，空白/行号/全角差异会被自动容忍，不需要转义；片段若落在某节点开头会优先选它。也可写 re:^片段 显式锚定节点开头（注入清单与助手复述的副本都落在行中间，锚定后不会误命中）。多命中会报错并列候选，不自动选' },
+        to: { type: 'string', description: '单段模式：定位终点节点，只在 from 命中的节点之后查找。写法同 from：字面文本或 re:^片段，须唯一命中' },
         summary: { type: 'string', description: '单段模式：检查点正文，替代被压缩区间的全部内容' },
         segments: {
           type: 'array',
@@ -1164,8 +1327,8 @@ export function apply(ctx, config) {
           items: {
             type: 'object',
             properties: {
-              from: { type: 'string', description: '这一段的起点：首选 re:^片段 锚定节点开头，也可用字面文本（空白折叠）' },
-              to: { type: 'string', description: '这一段的终点：首选 re:^片段 锚定节点开头，也可用字面文本（空白折叠）' },
+              from: { type: 'string', description: '这一段的起点：字面文本即可（空白/行号/全角差异自动容忍），或 re:^片段 显式锚定节点开头' },
+              to: { type: 'string', description: '这一段的终点：写法同 from，须唯一命中' },
               summary: { type: 'string', description: '这一段的检查点正文' },
             },
             required: ['summary'],
