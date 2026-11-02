@@ -499,6 +499,11 @@ function resolveLocate(session, from, to, options) {
           test: (raw) => re.test(raw) || re.test(flatOf(raw)),
           atStart: (raw) => anchored.test(flatOf(raw)),
         }],
+        // 命中片段长度：给「长度规则」兜底——太短的匹配说明模式不够挑剔。
+        probe: (raw) => {
+          const hit = re.exec(raw) ?? re.exec(flatOf(raw));
+          return hit ? hit[0].length : null;
+        },
       };
     }
     return {
@@ -540,6 +545,10 @@ function resolveLocate(session, from, to, options) {
         }
         if (atStart.length === 1 && all.length > 1) {
           notes.push(`${matcher.label} 共含于 ${all.length} 个节点，只有 #${pool[0]} 的开头与片段一致（其余是别处的复述），已选它；写 re:^ 可省掉这条提示`);
+        }
+        const hitLen = typeof matcher.probe === 'function' ? matcher.probe(readRawText(pool[0])) : null;
+        if (hitLen !== null && hitLen < 8) {
+          notes.push(`${matcher.label} 命中的片段只有 ${hitLen} 个字符——太短的模式容易在别处误命中；下次把片段加长并带长度量词（如 re:^\\s*独特开头{12,}）`);
         }
         return { seq: pool[0], levelIndex: li };
       }
@@ -1020,7 +1029,7 @@ function buildHintText(session, cfg, meter, pct, tokens, threshold) {
   return [
     template,
     `压多少：先看节点清单里的 token 分布，挑最旧、最大、已被后续信息取代的连续段；同一主题能一次压掉的别拆成多次小折；压完看占用，仍在阈值之上就继续下一段，回到阈值下方就停——不必追求某个固定比例。优先压：大块 tool 输出（源码、目录树、长日志）、已完成任务的探索与试错、重复确认；必须留：当前任务的决定、文件路径、命令、报错原文、用户明确要求。`,
-    `节点清单（类型/token + 内容开头；u=user a=assistant t=tool/result s=system d=developer；! =尾部保留）：共 ${measured.length} 个，合计约 ${totalTokens} token。压哪一段、压多少由你判断：挑最旧、最大、已被后续信息取代的连续区间，按内容里独特的一段写 from/to（字面文本、空白折叠、不用转义）。首选 re:^\\s*片段 锚定节点开头（\\s* 用来吸收原文开头的换行/缩进）——节点开头最不易重复，注入清单的副本和助手复述的副本都落在行中间，锚定后无法命中。两端若落在工具步中间会自动收敛到最近的安全切点；同一主题能一次压掉的别拆成多次小折，多段用 segments 一次压掉。`,
+    `节点清单（类型/token + 内容开头；u=user a=assistant t=tool/result s=system d=developer；! =尾部保留）：共 ${measured.length} 个，合计约 ${totalTokens} token。压哪一段、压多少由你判断：挑最旧、最大、已被后续信息取代的连续区间，按内容里独特的一段写 from/to（字面文本、空白折叠、不用转义）。首选复杂正则锚开头：re:^\\s*独特开头 后接长度量词（如 {12,} 或 [\\s\\S]{12,80}），把匹配长度钉死——短片段必然多命中，别用 .* 或 .+（跨节点贪心），跨行用 [\\s\\S]，可用 (?:a|b) 分支；节点开头最不易重复，副本都在行中间，锚定后不误命中。两端若落在工具步中间会自动收敛到最近的安全切点；同一主题能一次压掉的别拆成多次小折，多段用 segments 一次压掉。`,
     ...rows,
   ].join('\n');
 }
@@ -1323,13 +1332,13 @@ export function apply(ctx, config) {
     description:
       '把 surface 上的一段或几段区间各替换成一个检查点：你写的 summary 就是该段替换后保留的全部内容，被替换的节点从此不再进入上下文。' +
       '单段用 from/to/summary 按内容定位；多段用 segments: [{from, to, summary}, …]，一次调用把多段一起折掉，不用反复调用。' +
-      'from 匹配起点节点全文、to 匹配终点节点全文，给一段能唯一命中该节点的独特文本即可（文件名、命令、报错原文）；字面量匹配不需要转义，空白/换行/行号前缀/全角半角差异会被自动容忍（由严到宽逐级放宽，只有上一级零命中才降级）；并且若片段恰好落在唯一一个节点的开头，会优先选它（复述副本永不在开头），该判断会写进 warning。要从节点开头锚定就写 re: 前缀，并自己吸收原文开头的换行/缩进：re:^\\s*片段。host 会把原文和「折叠成一行、去掉行号前缀」的文本各试一次，但那只是兜底，别依赖它。' +
+      'from 匹配起点节点全文、to 匹配终点节点全文，给一段能唯一命中该节点的独特文本即可（文件名、命令、报错原文）；字面量匹配不需要转义，空白/换行/行号前缀/全角半角差异会被自动容忍（由严到宽逐级放宽，只有上一级零命中才降级）；并且若片段恰好落在唯一一个节点的开头，会优先选它（复述副本永不在开头），该判断会写进 warning。要从节点开头锚定就写 re: 前缀，并自己吸收原文开头的换行/缩进。提高命中率靠复杂正则：re:^\\s*独特开头 后接长度量词（{12,}、[\\s\\S]{12,80}），别用 .* / .+（跨节点贪心），跨行用 [\\s\\S]，可用 (?:a|b) 分支。host 会把原文和「折叠成一行、去掉行号前缀」的文本各试一次，但那只是兜底，别依赖它。' +
       '规则：①每段两端必须是平衡边界；②摘要必须明显短于被替换内容；③区间里可以包含之前生成的检查点（可以再次压缩）；' +
       '④当前轮次也可以压缩（只要区间结束于一个已闭合的步骤）；⑤压缩后你自己的摘要不能引用被删掉的原话，只保留结论、路径、命令与失败现场。',
     parameters: {
       type: 'object',
       properties: {
-        from: { type: 'string', description: '单段模式：定位起点节点。写一段能唯一命中该节点内容的话即可，空白/行号/全角差异会被自动容忍，不需要转义；片段若落在某节点开头会优先选它。也可写 re:^\\s*片段 显式锚定节点开头，\\s* 用来吸收原文开头的换行/缩进（注入清单与助手复述的副本都落在行中间，锚定后不会误命中）。多命中会报错并列候选，不自动选' },
+        from: { type: 'string', description: '单段模式：定位起点节点。写一段能唯一命中该节点内容的话即可，空白/行号/全角差异会被自动容忍，不需要转义；片段若落在某节点开头会优先选它。也可写复杂正则显式锚定节点开头：re:^\\s*独特开头 后接长度量词（如 {12,}、[\\s\\S]{12,80}），把匹配长度钉死，\\s* 吸收原文开头的换行/缩进；别用 .* / .+（跨节点贪心），跨行用 [\\s\\S]，可用 (?:a|b) 分支（注入清单与助手复述的副本都落在行中间，锚定后不会误命中）。多命中会报错并列候选，不自动选' },
         to: { type: 'string', description: '单段模式：定位终点节点，只在 from 命中的节点之后查找。写法同 from：字面文本或 re:^片段，须唯一命中' },
         summary: { type: 'string', description: '单段模式：检查点正文，替代被压缩区间的全部内容' },
         segments: {
@@ -1338,7 +1347,7 @@ export function apply(ctx, config) {
           items: {
             type: 'object',
             properties: {
-              from: { type: 'string', description: '这一段的起点：字面文本即可（空白/行号/全角差异自动容忍），或 re:^片段 显式锚定节点开头' },
+              from: { type: 'string', description: '这一段的起点：字面文本即可（空白/行号/全角差异自动容忍），或用复杂正则 re:^\\s*独特开头 并带长度量词（如 {12,}）显式锚定、钉死匹配长度' },
               to: { type: 'string', description: '这一段的终点：写法同 from，须唯一命中' },
               summary: { type: 'string', description: '这一段的检查点正文' },
             },
