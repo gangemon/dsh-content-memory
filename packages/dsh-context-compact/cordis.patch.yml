@@ -1,0 +1,19 @@
+- insert:
+    - id: context-compact
+      name: 'dsh-context-compact'
+      config:
+        toolName: compact_context
+        scanToolName: scan_context
+        enabled: true
+        keepTailNodes: 4
+        maxSpanNodes: 400
+        minShadowTokens: 400
+        requireShrink: true
+        summaryLanguage: '与对话相同的语言'
+        summaryStyle: '按主题分节；先写结论；保留文件路径、命令、失败现场原文；删掉过程性寒暄与重复确认'
+        extraRules: ''
+        injectPrompt: true
+        sectionOrder: 60
+        promptThresholdPct: 70
+        contextWindowTokens: 80000
+        maxHintRanges: 12
