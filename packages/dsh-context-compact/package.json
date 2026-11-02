@@ -11,8 +11,7 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "lib/index.js",
-    "lib/client.cjs",
+    "lib",
     "cordis.patch.yml",
     "README.md"
   ],
