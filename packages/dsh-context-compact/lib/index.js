@@ -432,23 +432,20 @@ function locateFailure(session, label, kind, hits, poolSize, context) {
       return '';
     }
   });
-  // 候选开头完全相同（例如多份「The file ... updated」）时，re:^ 锚点分不出它们，
-  // 再给就是误导：模型照抄后照样多命中。
+  // 候选的「可抄锚点」会重复（不同节点开头前缀相同、截断后一样）时，re:^ 锚点分不出它们，
+  // 再给就是误导：模型照抄后照样多命中。按锚点本身判重，而不是按整行文本。
   const firstHead = heads[0] ?? '';
-  const sameHead = firstHead.length >= 12 && heads.every((head) => {
-    const n = Math.min(head.length, firstHead.length);
-    return head.slice(0, n) === firstHead.slice(0, n);
-  });
-  const listed = hits.slice(0, 5).map((seq) => {
-    const anchor = sameHead ? '' : suggestAnchor(session, seq);
+  const anchors = hits.map((seq) => suggestAnchor(session, seq)).filter((anchor) => anchor.length > 0);
+  const anchorDup = hits.length > 1 && anchors.length > 0 && new Set(anchors).size < anchors.length;
+  const listed = hits.slice(0, 5).map((seq, i) => {
+    const anchor = anchorDup ? '' : suggestAnchor(session, seq);
     return `  ${nodeFingerprint(session, seq)}${anchor ? `\n      可抄锚点 ${anchor}` : ''}`;
   }).join('\n');
   const scope = ctx.atStartOnly
     ? `（只统计「片段出现在该节点开头」的命中${ctx.allHitCount > hits.length ? `；包含片段的节点另有 ${ctx.allHitCount - hits.length} 个，是别处的复述` : ''}）`
     : '';
-  const actions = sameHead
-    ? '这些候选开头的文本完全相同'
-      + `（「${firstHead.slice(0, 60)}…」${firstHead.length > 60 ? '等' : ''}），开头锚点无法区分它们。\n`
+  const actions = anchorDup
+    ? `这些候选的「可抄锚点」互相重复（开头都在「${firstHead.slice(0, 40)}${firstHead.length > 40 ? '…' : ''}」之内），照抄也分不出它们。\n`
       + '可执行的动作：\n'
       + '  1) 从节点内部的独有内容取片段：不同的路径、不同的报错原文、不同的参数值；\n'
       + '  2) 或先 scan_context 看清这些序号各是什么，再从它们的差异处取锚；\n'
