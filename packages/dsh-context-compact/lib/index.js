@@ -407,14 +407,17 @@ function locateFailure(session, label, kind, hits, poolSize, context) {
     ? 'from（区间起点）'
     : 'to（区间终点，只在 from 命中的节点之后查找）';
   if (kind === 'miss') {
-    const tried = Array.isArray(ctx.triedLevels) && ctx.triedLevels.length > 0
-      ? `已按「${ctx.triedLevels.join(' → ')}」逐级放宽，都没有命中。`
-      : '';
+    const levels = Array.isArray(ctx.triedLevels) ? ctx.triedLevels : [];
+    const tried = levels.length === 0
+      ? ''
+      : levels.length === 1 && levels[0] === 're:'
+        ? 're: 正则对原文和它的折叠形式（去空白、去行号前缀）都试过，没有命中。'
+        : `已按「${levels.join(' → ')}」逐级放宽，都没有命中。`;
     return new Error(
       `定位失败：${head} 没有匹配到任何节点。`
       + `${tried}当前可匹配节点 ${poolSize} 个`
       + '（已排除会被重新注入的上下文，以及最近的自有工具调用记录）。\n'
-      + '匹配是字面量子串，空白/换行/行号前缀/全角差异都已自动容忍，不需要转义。\n'
+      + '字面量匹配是子串，空白/换行/行号前缀/全角差异都已自动容忍，不需要转义。\n'
       + '可执行的动作：\n'
       + '  1) 用 scan_context 看清真实节点，再从它的开头 12–24 字取片段（别抄注入清单里的预览）；\n'
       + '  2) 片段不要跨越节点边界，要落在同一个节点内部；\n'
@@ -485,9 +488,17 @@ function resolveLocate(session, from, to, options) {
       } catch {
         anchored = re;
       }
+      // 原文常以换行/空白开头，直接对原文跑 `^` 会落不到节点真正开头，
+      // 所以先折叠成一行（顺便去掉行号前缀）再测；原文本身也试一遍，
+      // 让模型写跨行正则（如 `a\s+b`）时仍然有效。
+      const flatOf = (raw) => stripLineNumberPrefix(normalizeMatchText(raw));
       return {
         label,
-        levels: [{ name: 're:', test: (raw) => re.test(raw), atStart: (raw) => anchored.test(raw) }],
+        levels: [{
+          name: 're:',
+          test: (raw) => re.test(raw) || re.test(flatOf(raw)),
+          atStart: (raw) => anchored.test(flatOf(raw)),
+        }],
       };
     }
     return {
@@ -1312,7 +1323,7 @@ export function apply(ctx, config) {
     description:
       '把 surface 上的一段或几段区间各替换成一个检查点：你写的 summary 就是该段替换后保留的全部内容，被替换的节点从此不再进入上下文。' +
       '单段用 from/to/summary 按内容定位；多段用 segments: [{from, to, summary}, …]，一次调用把多段一起折掉，不用反复调用。' +
-      'from 匹配起点节点全文、to 匹配终点节点全文，给一段能唯一命中该节点的独特文本即可（文件名、命令、报错原文）；字面量匹配不需要转义，空白/换行/行号前缀/全角半角差异会被自动容忍（由严到宽逐级放宽，只有上一级零命中才降级）；并且若片段恰好落在唯一一个节点的开头，会优先选它（复述副本永不在开头），该判断会写进 warning。要用正则则写 re: 前缀。' +
+      'from 匹配起点节点全文、to 匹配终点节点全文，给一段能唯一命中该节点的独特文本即可（文件名、命令、报错原文）；字面量匹配不需要转义，空白/换行/行号前缀/全角半角差异会被自动容忍（由严到宽逐级放宽，只有上一级零命中才降级）；并且若片段恰好落在唯一一个节点的开头，会优先选它（复述副本永不在开头），该判断会写进 warning。要用正则则写 re: 前缀（正则也会对「折叠成一行、去掉行号前缀」的文本跑一遍，所以 re:^片段 能稳定落在节点真正开头，不受原文前导换行/缩进影响）。' +
       '规则：①每段两端必须是平衡边界；②摘要必须明显短于被替换内容；③区间里可以包含之前生成的检查点（可以再次压缩）；' +
       '④当前轮次也可以压缩（只要区间结束于一个已闭合的步骤）；⑤压缩后你自己的摘要不能引用被删掉的原话，只保留结论、路径、命令与失败现场。',
     parameters: {
