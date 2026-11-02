@@ -1,4 +1,4 @@
-﻿/**
+/**
  * dsh-context-compact —— 右侧栏「上下文」面板的浏览器端。
  *
  * 打包约定（照抄 memorygraph/compress 的写法）：这不是 ES 模块，也没有打包步骤。
@@ -164,6 +164,7 @@ window.__ModuleLoader__.load({
 .ccc-seg.is-fold{background:color-mix(in srgb, var(--dsw-alias-brand-primary) 78%, transparent);cursor:pointer}
 .ccc-seg.is-keep{background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 62%, transparent)}
 .ccc-seg.is-keep.is-node{box-shadow:inset 0 0 0 .5px color-mix(in srgb, var(--dsw-alias-state-warn-primary) 90%, transparent)}
+.ccc-seg.is-overhead{background:repeating-linear-gradient(45deg,color-mix(in srgb, var(--dsw-alias-label-secondary) 20%, transparent) 0 3px,color-mix(in srgb, var(--dsw-alias-label-secondary) 9%, transparent) 3px 6px);cursor:default;transition:none}
 .ccc-seg:hover{filter:brightness(1.22)}
 .ccc-seg.is-on{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-2px;filter:brightness(1.2)}
 .ccc-seg.is-group{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-2px;filter:brightness(1.28);z-index:3}
@@ -174,6 +175,7 @@ window.__ModuleLoader__.load({
 .ccc-dot{display:inline-block;width:7px;height:7px;border-radius:2px;margin-right:4px;vertical-align:middle;background:color-mix(in srgb, var(--dsw-alias-brand-primary) 78%, transparent)}
 .ccc-dot.is-plain{background:color-mix(in srgb, var(--dsw-alias-label-secondary) 34%, transparent)}
 .ccc-dot.is-keep{background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 62%, transparent);box-shadow:inset 0 0 0 1px var(--dsw-alias-border-l2)}
+.ccc-dot.is-overhead{background:repeating-linear-gradient(45deg,color-mix(in srgb, var(--dsw-alias-label-secondary) 30%, transparent) 0 2px,color-mix(in srgb, var(--dsw-alias-label-secondary) 10%, transparent) 2px 4px)}
 .ccc-map-tools{display:flex;align-items:center;gap:4px}
 .ccc-map-count{margin-right:2px}
 .ccc-mini{appearance:none;border:1px solid var(--dsw-alias-border-l1);background:transparent;border-radius:4px;padding:0 5px;font:inherit;font-size:10.5px;line-height:16px;cursor:pointer;color:var(--dsw-alias-label-secondary)}
@@ -542,6 +544,8 @@ window.__ModuleLoader__.load({
       const nodes = Array.isArray(props.nodes) ? props.nodes : []
       const ranges = Array.isArray(props.ranges) ? props.ranges : []
       const total = Number(props.windowTokens) > 0 ? Number(props.windowTokens) : 0
+      // 整窗口口径的实际占用（含系统提示词、工具定义等非节点开销）；节点 token 之和只是其中一部分。
+      const used = Number(props.usedTokens) > 0 ? Number(props.usedTokens) : 0
       const threshold = Number(props.thresholdPct)
       // 三种交互叠在同一条条带上：滚轮/按钮缩放看局部，拖框选一段，点色块看这一段的详情。
       const [zoom, setZoom] = React.useState(null)
@@ -605,12 +609,13 @@ window.__ModuleLoader__.load({
         }
         host.addEventListener('wheel', onWheel, { passive: false })
         return () => host.removeEventListener('wheel', onWheel)
-      }, [nodes.length, total])
+      }, [nodes.length, total, used])
 
       if (nodes.length === 0 || total === 0) return null
 
       const occupied = nodes.reduce((sum, node) => sum + (Number(node.tokens) || 0), 0)
-      const floor = Math.max(occupied, total, 1)
+      const overhead = Math.max(0, used - occupied)
+      const floor = Math.max(occupied, used, total, 1)
       const rangeOf = (seq) => ranges.find((range) => seq >= range.start && seq <= range.end) ?? null
 
       // 每个节点占的 token 区间：缩放、框选、阈值线都按这套偏移换算。
@@ -632,6 +637,21 @@ window.__ModuleLoader__.load({
         const index = groupSeen.get(key) ?? 0
         groupSeen.set(key, index + 1)
         segs.push({ key, range, index, from: span.from, to: span.to, tokens: span.tokens, keep: span.keep, seq: span.seq, node: span.node })
+      }
+      // 非节点开销也画成一段：不画出来，条带只到节点占比，顶部占用率和阈值线就对不上。
+      if (overhead > 0) {
+        segs.push({
+          key: 'overhead',
+          range: null,
+          index: 0,
+          from: occupied,
+          to: occupied + overhead,
+          tokens: overhead,
+          keep: false,
+          seq: null,
+          node: null,
+          overhead: true,
+        })
       }
       // 系统头不许被框进来，否则折到一半会被主机拒掉。
       const protectSeq = ranges.length === 0 ? -1 : Number(ranges[0].start)
@@ -866,7 +886,12 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: 'ccc-map-head' },
-          h('span', null, `上下文地图 · 已用 ${formatNum(occupied)} token`),
+          h(
+            'span',
+            null,
+            `上下文地图 · 已用 ${formatNum(used > 0 ? used : occupied)} token` +
+              (overhead > 0 ? `（节点 ${formatNum(occupied)} · 开销 ${formatNum(overhead)}）` : ''),
+          ),
           h(
             'span',
             { className: 'ccc-map-tools' },
@@ -891,8 +916,25 @@ window.__ModuleLoader__.load({
             const rangeKey = seg.range === null ? null : `${seg.range.start}-${seg.range.end}`
             const on = rangeKey !== null && rangeKey === activeKey
             const width = ((hi - lo) / viewWidth) * 100
+            const isOverhead = seg.overhead === true
             // 每个节点都能点：是否可折是压缩策略的判断，不该写进地图的交互里。
             // 点一个节点 = 摊开它所在的那一段（没有段就只摊开它自己）。
+            // 开销段不是节点，点它没有意义，只给个说明。
+            if (isOverhead) {
+              return h('div', {
+                key: 'seg-overhead',
+                className: 'ccc-seg is-overhead',
+                style: {
+                  position: 'absolute',
+                  top: 0,
+                  bottom: 0,
+                  left: `${pctOfOffset(lo)}%`,
+                  width: `calc(${width}% - 1px)`,
+                  minWidth: 1,
+                },
+                title: `系统提示词、工具定义等非节点开销 · ${formatNum(seg.tokens)} token`,
+              })
+            }
             return h('div', {
               key: `seg-${seg.seq}`,
               className:
@@ -964,7 +1006,8 @@ window.__ModuleLoader__.load({
           { className: 'ccc-map-legend' },
           h('span', null, h('span', { className: 'ccc-dot' }), '节点'),
           h('span', null, h('span', { className: 'ccc-dot is-keep' }), '尾部保留'),
-          h('span', null, '色块宽度 = token 占比'),
+          h('span', null, h('span', { className: 'ccc-dot is-overhead' }), '系统/工具开销'),
+          h('span', null, '色块宽度 = token 占比（整条 = 整个窗口）'),
         ),
         detail === null
           ? selection === null
@@ -1765,6 +1808,7 @@ window.__ModuleLoader__.load({
               nodes,
               ranges,
               windowTokens: snapshot?.windowTokens,
+              usedTokens: snapshot?.tokens,
               thresholdPct: snapshot?.promptThresholdPct,
               recommended,
               folding,

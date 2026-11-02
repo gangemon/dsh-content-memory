@@ -26,7 +26,13 @@
 | 192 | `structuredTextOf` | 消息结构化文本 |
 | 219 | `fullTextOf` | 节点全文（供摘要/正则匹配） |
 | 237 | `nodeKindOf` | 节点类型 u/a/t/s/d |
-| 249 | `resolveLocate` | **from/to 正则 → seq 区间**（含歧义/未命中报错） |
+| 267 | `locateExcludedSeqs` | 匹配池排除：重注入上下文 + 最近自有工具节点（断自指） |
+| 294 | `nodeFingerprint` | 节点结构指纹（序号/类型/token，不含原文） |
+| 313 | `locateFailure` | 定位失败报错（只给结构信息，绝不回显 from/to 原文） |
+| 347 | `resolveLocate` | from/to 字面量定位唯一 seq（多命中只报结构指纹） |
+| 406 | `convergeSpan` | 两端自动收敛到不劈开工具步的安全切点（只往更早走） |
+| 452 | `assertSpanUnambiguous` | 收敛后区间内 from/to 唯一性复检 |
+| 482 | `locateSpan` | 定位 + 收敛 + 复检三合一（工具调用入口） |
 | 287 | REGENERABLE_INJECTION_PATTERNS | 会被自动重注入的上下文模式 |
 | 294 | `latestRegenerableInjectionSeqs` | 每类最新注入 seq |
 | 310 | `regenerableInjectionTag` | 注入标签 |
@@ -35,7 +41,7 @@
 | 344 | `measureNodes` | 逐节点测量 |
 | 376 | `protectedHeadSeq` | 头部保护边界 |
 | 396 | `assertHeadExcluded` | 头部保护校验 |
-| 406 | `validateSpan` | 区间合法性（配对/越界/头部/重注入） |
+| 614 | `validateSpan` | 区间合法性兜底（配对/越界/头部/重注入） |
 | 435 | `parseSegmentArgs` | segments 参数解析 |
 | 461 | `aggregateFolds` | 多段结果聚合 |
 | 495 | `inspectEntryState` | 入口检查（可用性、失败原因） |
@@ -91,7 +97,8 @@
 - 改注入提示词怎么写 → `buildHintText@556`
 - 改节点清单格式 → `buildHintText@556` 末段 + `previewOf@181`
 - 改压缩工具参数 → compact_context 注册（~1000）+ `Config` 的 `toolName/toolDescription`
-- 改 from/to 匹配规则/报错 → `resolveLocate@249`、`validateSpan@406`
+- 改 from/to 匹配规则/报错 → `resolveLocate@347`、`locateFailure@313`、`locateSpan@482`
+- 改两端平衡/收敛行为 → `convergeSpan@406` + `validateSpan@614`（兜底）
 - 改圆环/地图外观 → client.cjs `ContextMap@541` + `CSS@45–210`
 - 改手动折叠表单 → `Sheet@1066`
 - 改折叠记录列表 → `FoldCard@1522`

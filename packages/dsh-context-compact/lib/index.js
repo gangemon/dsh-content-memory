@@ -3,7 +3,7 @@
  *
  * 让模型自己能压缩上下文：
  *   1. `scan_context`    —— 列出 surface 上每个节点（类型 / 体积 / 内容开头），供挑选区间；
- *   2. `compact_context` —— 模型直接给出检查点摘要正文，用 from/to 正则定位被替换区间，替换成一个检查点。
+ *   2. `compact_context` —— 模型直接给出检查点摘要正文，用 from/to 按内容定位被替换区间，替换成一个检查点。
  *
  * 事务协议与 `@deepseek-ai/dsh-compaction-basic` 一致：
  *   compaction/start → compaction/summary → user/message(surfaceOp replace) → compaction/end
@@ -242,40 +242,257 @@ function nodeKindOf(session, seq) {  try {
 }
 
 /**
- * 用正则定位压缩区间：`from` 匹配起点节点、`to` 匹配终点节点，都搜节点全文。
+ * 按内容定位压缩区间：`from` 匹配起点节点、`to` 匹配终点节点，都搜节点全文（字面量匹配，空白折叠；`re:` 前缀才当正则）。
  * 从 surface 靠前的节点开始找，`to` 在起点之后找。匹配不到直接报错，不猜。
  * 这样调用方只需要写「从这条消息到那条消息」，不必知道 surface 的 seq 编号。
  */
-function resolveLocate(session, from, to) {
+/** 匹配用的规范化文本：折叠所有空白并去首尾，使模型从预览（空白已压平）里
+ *  复制的片段能直接命中原文（原文里可能是换行/多空格）。 */
+function normalizeMatchText(text) {
+  return String(text ?? '').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * 定位匹配池要跳过的节点（全部按事件元数据识别，不按内容识别）：
+ *  1) 全部可再生注入节点——它们内嵌当时的节点清单，清单前缀就是节点开头；
+ *  2) 本插件自己的工具步：tool/call(compact_context) + 配对 tool/result，
+ *     以及紧随其后的 assistant 回复。
+ * 第 2 条的后半段是关键：定位失败后，模型往往在回复正文里复述刚才用的
+ * from/to 片段来解释失败，那条复述会变成新的命中源，并且随着每次失败继续累积。
+ * 排除掉「自己的工具步 + 紧随的解释」，这条自我强化的链就断了。
+ */
+function locateExcludedSeqs(session, toolName) {
   const nodes = session.surface.nodes;
-  const compile = (pattern, label) => {
-    if (typeof pattern !== 'string' || pattern.length === 0) {
-      throw new Error(`${label} 不能为空：给一段能匹配该端节点全文的正则`);
-    }
+  const excluded = new Set(allRegenerableInjectionSeqs(session));
+  const eventOf = (seq) => {
     try {
-      return new RegExp(pattern, 'i');
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      throw new Error(`${label} 不是有效的正则：${JSON.stringify(pattern)}（${reason}）`);
+      return session.eventAt(seq);
+    } catch {
+      return undefined;
     }
   };
-  const find = (re, beginIndex, label) => {
+  for (let i = 0; i < nodes.length; i += 1) {
+    const event = eventOf(nodes[i]);
+    if (event === undefined || event.type !== 'tool/call') continue;
+    if (event.data?.name !== toolName) continue;
+    excluded.add(nodes[i]);
+    let scanner = i + 1;
+    // 配对结果紧跟在它的 tool/call 后面，中间不会插进别的工具事件。
+    const paired = scanner < nodes.length ? eventOf(nodes[scanner]) : undefined;
+    if (paired !== undefined && paired.type === 'tool/result') {
+      excluded.add(nodes[scanner]);
+      scanner += 1;
+    }
+    // 紧随其后的 assistant 回复：模型常在这里复述刚才的定位片段。
+    for (; scanner < Math.min(nodes.length, i + 5); scanner += 1) {
+      const next = eventOf(nodes[scanner]);
+      if (next === undefined) continue;
+      if (next.type === 'assistant/message') {
+        excluded.add(nodes[scanner]);
+        break;
+      }
+      if (next.type === 'tool/call') break;
+    }
+  }
+  return excluded;
+}
+
+/** 节点的结构指纹：序号 + 事件类型 + 体积。**不含任何内容原文**——
+ *  错误消息本身也会进入 surface，一旦回显片段，下一次定位就会同时命中
+ *  「原节点」和「这条错误」，形成解不开的多命中。 */
+function nodeFingerprint(session, seq) {
+  const kind = (() => {
+    try {
+      return nodeKindOf(session, seq);
+    } catch {
+      return 'unknown';
+    }
+  })();
+  const tokens = (() => {
+    try {
+      return roughTokens(fullTextOf(session, seq));
+    } catch {
+      return 0;
+    }
+  })();
+  return `#${seq} [${kind}] 约 ${tokens} token`;
+}
+
+/** 定位失败的统一出口：只报结构信息与可执行动作，绝不回显 from/to 原文。 */
+function locateFailure(session, label, kind, hits, poolSize) {
+  const head = label === 'from'
+    ? 'from（区间起点）'
+    : 'to（区间终点，只在 from 命中的节点之后查找）';
+  if (kind === 'miss') {
+    return new Error(
+      `定位失败：${head} 没有匹配到任何节点。`
+      + `匹配是字面量（空白已折叠，不需要转义），当前可匹配节点 ${poolSize} 个`
+      + '（已排除会被重新注入的上下文，以及最近的自有工具调用记录）。\n'
+      + '请换一段更独特的文本再试：取该节点开头 20–40 字之后的内容，'
+      + '并避开之前定位失败说明里出现过的短语（那些短语现在同时存在于多个节点里）。',
+    );
+  }
+  const listed = hits.slice(0, 5).map((seq) => `  ${nodeFingerprint(session, seq)}`).join('\n');
+  return new Error(
+    `定位失败：${head} 命中了 ${hits.length} 个节点，无法确定唯一位置。`
+    + '压缩是破坏性操作，不会自动挑其中一个，请自己缩小范围。\n'
+    + `${listed}${hits.length > 5 ? `\n  …另有 ${hits.length - 5} 个` : ''}\n`
+    + '可执行的动作：\n'
+    + '  1) 把片段加长到足以唯一；\n'
+    + '  2) 改用节点内更靠后的独特文本（开头往往在多条消息里重复）；\n'
+    + '  3) 用 scan_context 看清这些序号分别是什么，再从那里取片段；\n'
+    + '  4) 如果另一端是唯一的，先定位另一端，再取它之前最近的平衡切点作这一端。',
+  );
+}
+
+/**
+ * 按内容定位区间两端。
+ *
+ * 默认是**字面量**匹配（空白折叠后子串包含），不再把 from/to 当正则——
+ * 模型不需要转义括号、星号、问号；想用正则时以 `re:` 开头显式声明。
+ * 任一端命中多个节点时直接报错，只给结构指纹不给原文，
+ * 也不默默取第一个（压缩是破坏性操作，选错区间比报错更糟）。
+ */
+function resolveLocate(session, from, to, options) {
+  const opts = options ?? {};
+  const nodes = session.surface.nodes;
+  const excluded = opts.excluded instanceof Set
+    ? opts.excluded
+    : locateExcludedSeqs(session, opts.toolName);
+  const matcherOf = (pattern, label) => {
+    if (typeof pattern !== 'string' || pattern.trim().length === 0) {
+      throw new Error(`${label} 不能为空：给一段能匹配该端节点内容开头/中间的字面文本（空白会被折叠，不需要转义）`);
+    }
+    const useRegex = pattern.startsWith('re:');
+    const source = useRegex ? pattern.slice(3) : pattern;
+    if (useRegex) {
+      let re;
+      try {
+        re = new RegExp(source, 'i');
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new Error(`${label} 的 re: 正则无效：${JSON.stringify(source)}（${reason}）；也可以去掉 re: 直接给字面文本`);
+      }
+      return (text) => re.test(text);
+    }
+    const needle = normalizeMatchText(source);
+    return (text) => text.includes(needle);
+  };
+  const findAll = (test, beginIndex, label) => {
+    const hits = [];
     for (let i = beginIndex; i < nodes.length; i += 1) {
+      if (excluded.has(nodes[i])) continue;
       let text = '';
       try {
-        text = fullTextOf(session, nodes[i]);
+        text = normalizeMatchText(fullTextOf(session, nodes[i]));
       } catch {
         text = '';
       }
-      if (re.test(text)) return nodes[i];
+      if (text && test(text)) hits.push(nodes[i]);
     }
-    throw new Error(
-      `定位规则 ${label}=${JSON.stringify(re.source)} 没有匹配到任何 surface 节点；请换一段更独特的片段`,
-    );
+    if (hits.length === 0) {
+      throw locateFailure(session, label, 'miss', [], nodes.length - excluded.size);
+    }
+    if (hits.length > 1) {
+      throw locateFailure(session, label, 'ambiguous', hits, nodes.length - excluded.size);
+    }
+    return hits[0];
   };
-  const start = find(compile(from, 'from'), 0, 'from');
-  const end = find(compile(to, 'to'), nodes.indexOf(start), 'to');
-  return { start, end };
+  const testFrom = matcherOf(from, 'from');
+  const testTo = matcherOf(to, 'to');
+  const start = findAll(testFrom, 0, 'from');
+  const end = findAll(testTo, nodes.indexOf(start), 'to');
+  return { start, end, testFrom, testTo, excluded };
+}
+
+/**
+ * 把已定位的两端收敛到「不劈开工具步」的最近安全切点：
+ * 起点不均衡 → 往更早找（把整步包进区间，不会少压关键内容）；
+ * 终点不均衡 → 往更早找（少压一段）。
+ * 两个方向都只往更早走，绝不把区间扩到更晚的节点上，
+ * 所以最坏结果是「压得比预期少」，而不是压坏别的步骤。
+ */
+function convergeSpan(session, start, end) {
+  const nodes = session.surface.nodes;
+  let startIdx = nodes.indexOf(start);
+  let endIdx = nodes.indexOf(end);
+  if (startIdx === -1) throw new Error(`定位到的起点 #${start} 不在当前 surface 上`);
+  if (endIdx === -1) throw new Error(`定位到的终点 #${end} 不在当前 surface 上`);
+  if (startIdx > endIdx) throw new Error(`起点 #${start} 在终点 #${end} 之后：from 要定位在 to 之前`);
+  const notes = [];
+  if (!toolPairingBalancedBefore(session, nodes[startIdx])) {
+    let moved = -1;
+    for (let i = startIdx - 1; i >= 0; i -= 1) {
+      if (toolPairingBalancedBefore(session, nodes[i])) {
+        moved = i;
+        break;
+      }
+    }
+    if (moved === -1) {
+      throw new Error(
+        `起点 #${start} 会把某个工具步劈开，往前也找不到安全切点；`
+        + '请把 from 移到某个完整步骤开头的 assistant 消息或 user 消息上',
+      );
+    }
+    notes.push(`起点 #${start} 会把工具步劈开，已前移到 #${nodes[moved]}`);
+    startIdx = moved;
+  }
+  if (!toolPairingBalancedAfter(session, nodes[endIdx])) {
+    let moved = -1;
+    for (let i = endIdx - 1; i >= startIdx; i -= 1) {
+      if (toolPairingBalancedAfter(session, nodes[i])) {
+        moved = i;
+        break;
+      }
+    }
+    if (moved === -1) {
+      throw new Error(
+        `终点 #${end} 会把某个工具步劈开或该步还没结束，往前也找不到安全切点；`
+        + '请把 to 移到这一步完全结束之后的节点内容上，或换一段更靠前的区间',
+      );
+    }
+    notes.push(`终点 #${end} 会把工具步劈开或该步未结束，已收窄到 #${nodes[moved]}`);
+    endIdx = moved;
+  }
+  return { start: nodes[startIdx], end: nodes[endIdx], startIdx, endIdx, notes };
+}
+
+/** 收敛后的区间复检：两端片段在区间内必须各自唯一，否则说明片段太宽泛。 */
+function assertSpanUnambiguous(session, span, located) {
+  const nodes = session.surface.nodes;
+  // 注入容器里嵌着节点清单，区间内可能有它；复检时跳过，否则会误判「片段太宽泛」。
+  const skip = located.excluded instanceof Set ? located.excluded : new Set();
+  for (const [label, test] of [['from', located.testFrom], ['to', located.testTo]]) {
+    let hits = 0;
+    for (let i = span.startIdx; i <= span.endIdx; i += 1) {
+      const seq = nodes[i];
+      if (skip.has(seq)) continue;
+      let text = '';
+      try {
+        text = normalizeMatchText(fullTextOf(session, seq));
+      } catch {
+        text = '';
+      }
+      if (text && test(text)) hits += 1;
+    }
+    if (hits > 1) {
+      throw new Error(
+        `收敛后的区间里，${label} 片段又命中了 ${hits} 个节点（片段太宽泛）；`
+        + `请换一段更独特的文本，或把 from/to 直接写在区间内部靠后的位置`,
+      );
+    }
+  }
+}
+
+/**
+ * 按内容定位 + 平衡收敛 + 唯一性复检，一次给出可直接提交的区间。
+ * 调用方只需要 from/to，不需要知道 seq、也不需要自己处理工具配对。
+ */
+function locateSpan(session, from, to, options) {
+  const located = resolveLocate(session, from, to, options);
+  const span = convergeSpan(session, located.start, located.end);
+  assertSpanUnambiguous(session, span, located);
+  return span;
 }
 
 /**
@@ -287,7 +504,30 @@ function resolveLocate(session, from, to) {
 const REGENERABLE_INJECTION_PATTERNS = [
   ['system-reminder', /^<system-reminder>/i],
   ['runtime-context', /^Current runtime context\. This snapshot supersedes/i],
+  // 压缩提示本身：每条都内嵌当时的完整节点清单，而清单的每条前缀就是节点开头。
+  ['compact-hint', /^上下文占用约/],
 ];
+
+/** 全部可再生注入节点（不只最新一条）。
+ *  定位匹配池必须排除**全部**：历史上每条压缩提示里都嵌着当时的节点清单，
+ *  拿清单里的前缀当 from/to，会在每一个注入消息里重复命中。 */
+function allRegenerableInjectionSeqs(session) {
+  const nodes = session.surface.nodes;
+  const headSeq = protectedHeadSeq(session);
+  const headIdx = headSeq === undefined ? -1 : nodes.indexOf(headSeq);
+  const all = [];
+  for (let i = 0; i < nodes.length; i += 1) {
+    if (headIdx !== -1 && i <= headIdx) continue;
+    const preview = previewOf(session, nodes[i]);
+    for (const [, pattern] of REGENERABLE_INJECTION_PATTERNS) {
+      if (pattern.test(preview)) {
+        all.push(nodes[i]);
+        break;
+      }
+    }
+  }
+  return all;
+}
 
 /** 每类可再生注入里「最新的一条」：只有它会在下一步被重新注入并取代旧快照。
  *  更早的同名注入已经被更新的取代，历史里留着只是过时内容，可以折叠。 */
@@ -414,10 +654,16 @@ function validateSpan(session, start, end) {
   }
   assertHeadExcluded(session, nodes.slice(startIdx, endIdx + 1), start);
   if (!toolPairingBalancedBefore(session, nodes[startIdx])) {
-    throw new Error(`起点 #${start} 不是平衡边界：会把某一步的 tool-call 与结果劈开`);
+    throw new Error(
+      `起点 #${start} 不是平衡边界：会把某一步的 tool-call 与结果劈开。`
+      + '请把 from 换成更靠后、作为完整步骤开头的节点内容（例如该步之后的 assistant 消息或 user 消息）。',
+    );
   }
   if (!toolPairingBalancedAfter(session, nodes[endIdx])) {
-    throw new Error(`end seq ${end} 不是平衡边界：会把某一步劈开，或该步尚未结束`);
+    throw new Error(
+      `end seq ${end} 不是平衡边界：会把某一步劈开，或该步尚未结束。`
+      + '请把 to 换成这一步完全结束之后的节点内容（通常是下一条 assistant 消息或 user 消息），或换一段更靠前的区间。',
+    );
   }
   return {
     start,
@@ -448,10 +694,10 @@ function parseSegmentArgs(a) {
     const summary = typeof item.summary === 'string' ? item.summary.trim() : '';
     if (summary.length === 0) throw new Error(`${at}.summary 不能为空：这一段的检查点内容就是你写的摘要`);
     if (item.from === undefined || item.to === undefined) {
-      throw new Error(`${at} 需要 from 和 to：正则定位区间两端`);
+      throw new Error(`${at} 需要 from 和 to：按内容定位区间两端（字面文本，空白折叠）`);
     }
     if (item.start !== undefined || item.end !== undefined) {
-      throw new Error(`${at} 不再支持 start/end：用 from/to 正则定位`);
+      throw new Error(`${at} 不再支持 start/end：用 from/to 按内容定位`);
     }
     return { from: String(item.from), to: String(item.to), summary };
   });
@@ -465,6 +711,8 @@ function aggregateFolds(results, dryRun, requestedSpans) {
       index,
       startSeq: dryRun && requested !== undefined ? requested.start : result.startSeq,
       endSeq: dryRun && requested !== undefined ? requested.end : result.endSeq,
+      startIndex: result.startIndex,
+      endIndex: result.endIndex,
       replacedNodes: result.replacedNodes,
       shadowedTokens: result.shadowedTokens,
       summaryTokens: result.summaryTokens,
@@ -598,7 +846,7 @@ function buildHintText(session, cfg, meter, pct, tokens, threshold) {
   return [
     template,
     `压多少：先看节点清单里的 token 分布，挑最旧、最大、已被后续信息取代的连续段；同一主题能一次压掉的别拆成多次小折；压完看占用，仍在阈值之上就继续下一段，回到阈值下方就停——不必追求某个固定比例。优先压：大块 tool 输出（源码、目录树、长日志）、已完成任务的探索与试错、重复确认；必须留：当前任务的决定、文件路径、命令、报错原文、用户明确要求。`,
-    `节点清单（类型/token + 内容开头；u=user a=assistant t=tool/result s=system d=developer；! =尾部保留）：共 ${measured.length} 个，合计约 ${totalTokens} token。压哪一段、压多少由你判断：按内容里独特的一段写 from/to 正则定位（例如 from: "某文件路径片段"、to: "某条报错原文"，正则特殊字符记得转义）；挑过时且已被取代的连续区间，两端须工具配对，多段用 segments 一次压掉。`,
+    `节点清单（类型/token + 内容开头；u=user a=assistant t=tool/result s=system d=developer；! =尾部保留）：共 ${measured.length} 个，合计约 ${totalTokens} token。压哪一段、压多少由你判断：挑最旧、最大、已被后续信息取代的连续区间，按内容里独特的一段写 from/to（字面文本、空白折叠、不用转义）。首选 re:^片段 锚定节点开头——节点开头最不易重复，注入清单里的副本和助手复述的副本都落在行中间，锚定后无法命中。两端若落在工具步中间会自动收敛到最近的安全切点；同一主题能一次压掉的别拆成多次小折，多段用 segments 一次压掉。`,
     ...rows,
   ].join('\n');
 }
@@ -825,7 +1073,7 @@ export function apply(ctx, config) {
     name: cfg.scanToolName,
     description:
       '列出当前会话 surface 上的每个节点：seq、事件类型、估算 token 体积、内容预览。' +
-      '压缩上下文前先用它挑出一段可折叠的区间，按内容里独特的一段写 from/to 正则交给 compact_context（from 匹配起点节点全文、to 匹配终点节点全文）。' +
+      '压缩上下文前先用它挑出一段可折叠的区间，按内容里独特的一段写 from/to 交给 compact_context（字面量匹配，空白折叠，不用转义；from 匹配起点、to 匹配终点）。' +
       '能压就多压：优先一次把多段写成 segments 一起传进去，而不是一段一段来。' +
       '工具调用与工具结果必须成对落在区间内，否则压缩会被拒绝。',
     parameters: {
@@ -843,8 +1091,8 @@ export function apply(ctx, config) {
         properties: {
           totalTokens: { type: 'number' },
           nodeCount: { type: 'number' },
-          recommendedStart: { type: 'integer', description: '推荐区间起点（仅展示用，压缩请用 from/to 正则）；0 表示当前没有可压缩区间' },
-          recommendedEnd: { type: 'integer', description: '推荐区间终点（仅展示用，压缩请用 from/to 正则）；0 表示当前没有可压缩区间' },
+          recommendedStart: { type: 'integer', description: '推荐区间起点（仅展示用，压缩请用 from/to）；0 表示当前没有可压缩区间' },
+          recommendedEnd: { type: 'integer', description: '推荐区间终点（仅展示用，压缩请用 from/to）；0 表示当前没有可压缩区间' },
           nodes: { type: 'array', items: { type: 'object', additionalProperties: true } },
           compressible: { type: 'array', items: { type: 'object', additionalProperties: true } },
         },
@@ -900,15 +1148,15 @@ export function apply(ctx, config) {
     name: cfg.toolName,
     description:
       '把 surface 上的一段或几段区间各替换成一个检查点：你写的 summary 就是该段替换后保留的全部内容，被替换的节点从此不再进入上下文。' +
-      '单段用 from/to/summary 正则定位；多段用 segments: [{from, to, summary}, …]，一次调用把多段一起折掉，不用反复调用。' +
-      'from 匹配起点节点全文、to 匹配终点节点全文，按内容里独特的一小段（文件名、命令、报错原文）写规则即可；正则特殊字符（[ ] ( ) . * + ? 等）记得转义。' +
+      '单段用 from/to/summary 按内容定位；多段用 segments: [{from, to, summary}, …]，一次调用把多段一起折掉，不用反复调用。' +
+      'from 匹配起点节点全文、to 匹配终点节点全文，给一段能唯一命中该节点的独特文本即可（文件名、命令、报错原文）；默认按字面量匹配（空白折叠），不需要转义；要用正则则写 re: 前缀。' +
       '规则：①每段两端必须是平衡边界；②摘要必须明显短于被替换内容；③区间里可以包含之前生成的检查点（可以再次压缩）；' +
       '④当前轮次也可以压缩（只要区间结束于一个已闭合的步骤）；⑤压缩后你自己的摘要不能引用被删掉的原话，只保留结论、路径、命令与失败现场。',
     parameters: {
       type: 'object',
       properties: {
-        from: { type: 'string', description: '单段模式：正则，从靠前的节点里找第一个全文匹配的作为起点（与 to 配对）' },
-        to: { type: 'string', description: '单段模式：正则，在起点之后找第一个全文匹配的作为终点（与 from 配对）' },
+        from: { type: 'string', description: '单段模式：定位起点节点。首选正则 re:^片段 锚定节点开头（注入清单与助手复述的副本都落在行中间，锚定后不会误命中）；也可用字面文本（空白折叠），如 某文件路径片段。须唯一命中' },
+        to: { type: 'string', description: '单段模式：定位终点节点，只在 from 命中的节点之后查找。首选 re:^片段 锚定节点开头；也可用字面文本。须唯一命中' },
         summary: { type: 'string', description: '单段模式：检查点正文，替代被压缩区间的全部内容' },
         segments: {
           type: 'array',
@@ -916,8 +1164,8 @@ export function apply(ctx, config) {
           items: {
             type: 'object',
             properties: {
-              from: { type: 'string', description: '这一段的起点正则' },
-              to: { type: 'string', description: '这一段的终点正则' },
+              from: { type: 'string', description: '这一段的起点：首选 re:^片段 锚定节点开头，也可用字面文本（空白折叠）' },
+              to: { type: 'string', description: '这一段的终点：首选 re:^片段 锚定节点开头，也可用字面文本（空白折叠）' },
               summary: { type: 'string', description: '这一段的检查点正文' },
             },
             required: ['summary'],
@@ -937,8 +1185,10 @@ export function apply(ctx, config) {
           ok: { type: 'boolean' },
           dryRun: { type: 'boolean' },
           compactionId: { type: 'string', description: '这次压缩的事务 id；dryRun 时为空串' },
-          startSeq: { type: 'integer', description: '实际替换区间起点；dryRun 时为 0' },
-          endSeq: { type: 'integer', description: '实际替换区间终点；dryRun 时为 0' },
+          startSeq: { type: 'integer', description: '实际替换区间起点的 seq；dryRun 时为 0。seq 是节点创建号，不代表对话顺序，看区间请用 startIndex/endIndex' },
+          endSeq: { type: 'integer', description: '实际替换区间终点的 seq；dryRun 时为 0' },
+          startIndex: { type: 'integer', description: '起点在 surface 上的位置（0 基），与 endIndex 一起才是区间的真实顺序' },
+          endIndex: { type: 'integer', description: '终点在 surface 上的位置；startIndex ≤ endIndex' },
           replacedNodes: { type: 'number' },
           shadowedTokens: { type: 'number' },
           summaryTokens: { type: 'number' },
@@ -977,11 +1227,15 @@ export function apply(ctx, config) {
       const summaryText = typeof a.summary === 'string' ? a.summary.trim() : '';
       if (summaryText.length === 0) throw new Error('summary 不能为空：检查点的全部内容就是你写的这段摘要');
       if (a.from === undefined || a.to === undefined) {
-        throw new Error('from 与 to 要一起给：from 定位区间起点、to 定位终点，都用正则匹配节点全文；要压多段请用 segments');
+        throw new Error('from 与 to 要一起给：from 定位区间起点、to 定位终点，按字面文本匹配节点全文（空白折叠），要正则写 re: 前缀；要压多段请用 segments');
       }
-      const { start, end } = resolveLocate(session, a.from, a.to);
+      const span = locateSpan(session, a.from, a.to, { toolName: cfg.toolName });
 
-      return performFold(session, start, end, { ...common, summary: summaryText });
+      return performFold(session, span.start, span.end, {
+        ...common,
+        summary: summaryText,
+        locateNotes: span.notes,
+      });
     },
   });
 
@@ -1031,7 +1285,7 @@ export function apply(ctx, config) {
       throw new Error('summary 不能为空：检查点的全部内容就是调用方写的摘要');
     }
     // 显式区间若压到「每步会被重新注入」的节点，自动把终点收回到它之前。
-    const foldNotes = [];
+    const foldNotes = [...(opts.locateNotes ?? [])];
     if (cfg.protectRegenerableInjections) {
       const shrunk = shrinkPastRegenerableInjection(session, start, end);
       if (shrunk.end !== end) {
@@ -1081,6 +1335,8 @@ export function apply(ctx, config) {
       compactionId: '',
       startSeq: opts.dryRun === true ? 0 : start,
       endSeq: opts.dryRun === true ? 0 : end,
+      startIndex: selection.startIdx,
+      endIndex: selection.endIdx,
       replacedNodes: selection.shadowedSeqs.length,
       shadowedTokens: shadowedTokenCount,
       summaryTokens,
@@ -1168,12 +1424,10 @@ export function apply(ctx, config) {
     // 逐段先过一遍边界校验：这里就会拦下越界、劈开 tool-call、框进 system 头部。
     const spans = segments.map((seg, index) => {
       try {
-        const range = seg.from !== undefined
-          ? resolveLocate(session, seg.from, seg.to)
-          : { start: seg.start, end: seg.end };
+        const range = locateSpan(session, seg.from, seg.to, { toolName: cfg.toolName });
         return {
           index,
-          seg: { ...seg, start: range.start, end: range.end },
+          seg: { ...seg, start: range.start, end: range.end, locateNotes: range.notes },
           selection: validateSpan(session, range.start, range.end),
         };
       } catch (error) {
@@ -1202,6 +1456,7 @@ export function apply(ctx, config) {
     const previews = ordered.map(({ seg, index }) => performFold(session, seg.start, seg.end, {
       ...opts,
       summary: seg.summary,
+      locateNotes: seg.locateNotes,
       continuation: index > 0,
       dryRun: true,
     }));
@@ -1662,11 +1917,10 @@ export function apply(ctx, config) {
           const rawTail = String(previewOf(session, end) ?? '').replace(/\s+/g, ' ').trim();
           const head = rawHead.slice(0, 40);
           const tail = rawTail.slice(0, 40);
-          const escapeRe = (text) => String(text ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
           instruction =
             `【上下文面板】请用 ${cfg.toolName} 折叠 surface 上「${head}」到「${tail}」这段区间：`
-            + `先用 ${cfg.scanToolName} 核对两端节点，再用 from/to 正则定位（from: "${escapeRe(head)}"、to: "${escapeRe(tail)}"，正则特殊字符记得转义；`
-            + '匹配不唯一时换两端更独特的一段内容）。'
+            + `先用 ${cfg.scanToolName} 核对两端节点，再用 from/to 定位（不用转义，按字面文本匹配：from: "${head}"、to: "${tail}"；`
+            + '命中多个节点或找不到时，按报错里列出的候选换一段更独特的文本）。'
             + `然后写一份只保留结论、路径、命令与失败现场的摘要（语言：${cfg.summaryLanguage}；写法：${cfg.summaryStyle}）。`
             + '这只是腾地方，不要在这条消息后继续别的任务。';
         } else {
@@ -1760,7 +2014,7 @@ export function apply(ctx, config) {
   const baseRules = [
     '上下文越长，旧内容越稀释注意力；压缩把过时对话折叠成摘要，腾出窗口给当前任务。',
     '压缩哪些：已被后续信息取代、与当前任务无关的早期探索与试错、重复确认；保留当前任务的决定、文件路径、命令、失败现场和用户明确要求。',
-    `用 ${cfg.toolName}：下面会给出完整节点清单（类型/token + 内容开头），按内容写 from/to 正则定位（from 匹配起点节点全文、to 匹配终点节点全文，正则特殊字符记得转义）；也可以用 start/end（scan_context 的 compressible 里直接给）；多段用 segments 数组（同一主题能一次压掉就别拆成多次；单次段数上限、每段节点上限、最小收益门槛见工具描述，超限会被拒绝）；区间两端须平衡（tool-call 与结果成对）；尾部 ${cfg.keepTailNodes} 条保留。`,
+    `用 ${cfg.toolName}：下面会给出完整节点清单（类型/token + 内容开头），按内容写 from/to 定位（字面文本、空白折叠、不用转义；from 定位起点节点、to 定位终点节点，每端须唯一命中）；两端若落在工具步中间会自动收敛到最近的安全切点（只会少压，不会劈开步骤）；多段用 segments 数组（同一主题能一次压掉就别拆成多次；单次段数上限、每段节点上限、最小收益门槛见工具描述，超限会被拒绝）；尾部 ${cfg.keepTailNodes} 条保留。`,
     `${cfg.requireShrink ? '摘要必须明显短于被替换内容；' : ''}摘要语言：${cfg.summaryLanguage}；写法：${cfg.summaryStyle}。压缩后只看得到摘要：路径、命令、失败现场必须写进摘要。`,
     cfg.extraRules ? `额外硬规则：${cfg.extraRules}` : '',
   ].filter((line) => line.length > 0);
