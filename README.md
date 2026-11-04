@@ -16,10 +16,25 @@ DeepSeek Harness 的上下文压缩插件：让模型自己把过时的上下文
 ```bash
 npm i -g dsh @deepseek-ai/dsh
 cd <你的 profile 目录>
-npm i dsh-context-compact
+```
+
+三种装法选一种：
+
+```bash
+# 1. 直接从 GitHub 装子包（pnpm 需要能访问 codeload.github.com）
+pnpm add "https://github.com/gangemon/dsh-content-memory.git#path:/packages/dsh-context-compact"
+
+# 2. 从本地克隆装（仓库已 clone 到本地时；等价于符号链接，改源码即生效）
+pnpm add /path/to/dsh-content-memory/packages/dsh-context-compact
+
+# 3. 从打包好的 tgz 装
+cd /path/to/dsh-content-memory/packages/dsh-context-compact && pnpm pack
+cd <你的 profile 目录> && pnpm add /path/to/dsh-context-compact-0.1.0.tgz
 ```
 
 装好后在 profile 的 `cordis.patch.yml` 里启用（插件自带 patch 片段）。
+
+> 若第 1 种报 `codeload.github.com ... 404`：这是网络到 codeload 不通（git 本身能推拉不代表 codeload 通），pnpm 的 GitHub 依赖一律从 codeload 取 tarball。挂代理，或改用 2、3。
 
 ## 使用
 
