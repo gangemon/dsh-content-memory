@@ -2,6 +2,7 @@
 
 > 用途：改代码前先在这里找行号，再 `read <文件> <offset> <limit>` 精读那一段，别整文件读。
 > 行号会随改动漂移；`grep -n "<符号名>" lib/index.js` 可随时校准。生成于 2026-11-03，刷新于 2026-11-04。
+> 2026-11-04 最小版定案：`injectSeq` = 请求期覆盖 `deriveMessages` 打 `[#seq]`（新增 `SEQ_TAGGER` / `tagFirstTextBlock` / `taggedMessage` / `installSeqTagger`，共 +55 行）；`injectSeqIndex` 单独控制节点索引消息。`Config` 之后所有行号在此版已统一校准。
 
 ## lib/index.js（约 2260 行，ESM）
 
@@ -12,12 +13,17 @@
 | 39 | `name` | 插件名 `context-compact` |
 | 41 | `inject` | 宿主服务依赖：tools、systemPrompt |
 | 43–48 | CHECKPOINT_* / SUMMARY_* | 检查点框架标签 |
-| 50–103 | `Config` | 全部配置项（阈值、动作、摘要模板、提示词模板、工具名/描述） |
-| 104 | SETTINGS_FILE | 运行时覆盖存盘路径 |
-| 110 | `readSettings` | 读运行时覆盖 |
-| 120 | `writeSettings` | 写运行时覆盖 |
-| 128 | `effectiveThreshold` | 阈值（配置 ∪ 运行时覆盖） |
-| 135 | `effectiveAction` | 动作（compress/kill/context） |
+| 50–114 | `Config` | 全部配置项（阈值、动作、摘要模板、提示词模板、工具名/描述、`injectSeq` / `injectSeqIndex`） |
+| 123 | `buildSeqIndexText` | `[#seq]` 节点索引消息正文（`injectSeqIndex` 开启时用，见 docs/node-seq.md） |
+| 147 | `SEQ_TAGGER` | 会话实例上「已装打标」的标记 Symbol |
+| 150 | `tagFirstTextBlock` | 把 `[#seq]` 压到第一个文本块前（无文本块则插一个） |
+| 161 | `taggedMessage` | 只给 user / tool 消息克隆出带标记的新消息对象 |
+| 168 | `installSeqTagger` | 覆盖该会话实例的 `deriveMessages`：请求期给每条 user/tool 消息加 `[#seq]`，不写日志 |
+| 199 | SETTINGS_FILE | 运行时覆盖存盘路径 |
+| 205 | `readSettings` | 读运行时覆盖 |
+| 215 | `writeSettings` | 写运行时覆盖 |
+| 223 | `effectiveThreshold` | 阈值（配置 ∪ 运行时覆盖） |
+| 230 | `effectiveAction` | 动作（compress/kill/context） |
 | 142 | `effectiveTemplate` | 摘要模板选择 |
 | 149 | `optionalService` | 取可选宿主服务 |
 | 166 | `textOfMessage` | 消息文本抽取 |

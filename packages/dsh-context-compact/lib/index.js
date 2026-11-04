@@ -2,8 +2,8 @@
  * dsh-context-compact
  *
  * 让模型自己能压缩上下文：
- *   1. `scan_context`    —— 列出 surface 上每个节点（类型 / 体积 / 内容开头），供挑选区间；
- *   2. `compact_context` —— 模型直接给出检查点摘要正文，用 from/to 按内容定位被替换区间，替换成一个检查点。
+ *   1. `scan_context`    —— 列出 surface 上每个节点（类型 / 体积 / 内容开头），供挑选区间；默认不注册（cfg.scanTool），
+ *   2. `compact_context` —— 模型直接给出检查点摘要正文，默认用 start/end 节点编号定位被替换区间（from/to 内容锚点作兜底），替换成一个检查点。
  *
  * 事务协议与 `@deepseek-ai/dsh-compaction-basic` 一致：
  *   compaction/start → compaction/summary → user/message(surfaceOp replace) → compaction/end
@@ -51,6 +51,10 @@ export const Config = z.object({
   enabled: z.boolean().default(true).description('是否注册压缩工具'),
   toolName: z.string().default('compact_context').description('压缩工具的模型可见名称'),
   scanToolName: z.string().default('scan_context').description('扫描工具的模型可见名称'),
+  scanTool: z
+    .boolean()
+    .default(false)
+    .description('是否注册扫描工具（scan_context）：默认关闭，定位直接用消息里的 [#N] 编号；打开后模型会多一条「先扫清单再挑编号」的路径与一份节点清单开销'),
   keepTailNodes: z
     .number()
     .default(4)
@@ -80,25 +84,225 @@ export const Config = z.object({
   promptThresholdPct: z
     .number()
     .default(70)
-    .description('上下文占用达到该百分比时向模型注入压缩提示词；0 表示每次都注入'),
+    .description('反思线（占用率百分比）：它是提醒回头看前缀的刻度，压制与否按内容判据决定；0 表示每次都提醒'),
   triggerAction: z
     .union(['inject', 'fold', 'off'].map((value) => z.const(value)))
     .default('inject')
-    .description('阈值触发后做什么：inject 只注入提示词让模型自己决定，fold 由面板直接折叠建议区间，off 只显示不提示'),
+    .description('越过反思线后做什么：inject 只注入提示词让模型自己决定，fold 由面板直接折叠建议区间，off 只显示不提示'),
   injectTemplate: z
     .string()
     .default(
-      '上下文占用约 {pct}%（约 {tokens} token），已过 {threshold}% 阈值：旧内容在稀释注意力、挤占任务窗口，'
-        + '压缩是把过时上下文折叠成摘要、腾出空间给当前任务。'
-        + '凭你自己的对话上下文判断压哪一段、压多少。',
+      '上下文占用约 {pct}%（约 {tokens} token），此刻正越过 {threshold}% 反思线。'
+        + '反思线是提醒你回头看一眼前缀、重新掂量注意力分配的刻度：把某段旧内容留在前缀里，它继续和当前证据争注意力；折叠它，换回一段更短、更贴近当前任务的摘要。'
+        + '按上面的判据权衡这两边，挑已被后续取代的那段压，挑构成当前证据的那段留，随时可做。',
     )
-    .description('阈值触发时注入给模型的提示词（开场白）；占位符：{pct} {tokens} {threshold} {tool}。插件会在其后固定追加「压多少」与 from/to 写法说明，不注入节点清单、不预切可压区间'),
+    .description('越过反思线时注入给模型的提示词（开场白）；占位符：{pct} {tokens} {threshold} {tool}。插件会在其后固定追加「压多少」与定位方式说明（默认按节点编号 start/end，from/to 作兜底），不注入节点清单、不预切可压区间'),
   contextWindowTokens: z
     .number()
     .default(80000)
     .description('估算占用率用的上下文窗口大小（token）；与实际窗口不一致时按比例调整'),
   maxHintRanges: z.number().default(12).description('提示词里最多列多少个可压缩区间'),
+  injectSeq: z
+    .boolean()
+    .default(false)
+    .description('是否给请求里的每条消息加 [#seq 体积] 前缀（请求期改写 deriveMessages 的返回值，不写会话日志）；默认关闭'),
+  snapSpan: z
+    .boolean()
+    .default(true)
+    .description('start/end 落在工具步中间时自动吸附到最近的合法平衡边界（默认开启）；关掉则直接报错'),
+  injectSeqIndex: z
+    .boolean()
+    .default(false)
+    .description('是否额外在越过反思线时注入一条「surface 节点索引」消息（每行 [#seq] 类型 预览）；默认关闭'),
+  seqIndexMaxNodes: z
+    .number()
+    .default(40)
+    .description('节点索引最多列多少个节点（取 surface 尾部最近的 N 个，更早的折叠成一行说明）'),
+  seqIndexPreviewChars: z
+    .number()
+    .default(40)
+    .description('节点索引里每个节点的预览字数（只用于辨认是哪个节点，不是全文）'),
 });
+
+/**
+ * surface 节点索引：每行「[#seq] 类型 预览」。
+ * 只用于让模型按编号指节点（省掉猜测「我说的是哪条」），不是全文，也不该被抄进回复。
+ */
+function buildSeqIndexText(session, cfg) {
+  const nodes = session.surface.nodes;
+  if (nodes.length === 0) return '';
+  const limit = Math.max(1, Math.floor(cfg.seqIndexMaxNodes));
+  const start = Math.max(0, nodes.length - limit);
+  const lines = [];
+  if (start > 0) lines.push(`（只列最近 ${nodes.length - start} 个节点，共 ${nodes.length} 个；更早的省略）`);
+  for (let i = start; i < nodes.length; i += 1) {
+    const seq = nodes[i];
+    const preview = clip(String(previewOf(session, seq) ?? '').replace(/\s+/g, ' ').trim(), cfg.seqIndexPreviewChars);
+    lines.push(`[#${seq}] ${nodeKindOf(session, seq)} ${preview}`.trimEnd());
+  }
+  return [
+    'surface 节点索引（编号只用于定位；不要把 [#编号] 抄进回复或摘要）：',
+    ...lines,
+  ].join('\n');
+}
+
+/**
+ * 请求期给 user / tool 消息加 `[#seq]` 前缀。
+ * 只覆盖会话实例的 deriveMessages：改的是这一次请求里模型看到的消息，
+ * 不写会话日志、不动 surface 节点，关掉开关就彻底消失。
+ * 编号 = 节点在 surface 上的 seq，和 scan_context / compact_context 用的编号同源。
+ */
+const SEQ_TAGGER = Symbol('context-compact:seq-tagger');
+
+/** 打标时用哪个 meter 读节点体积；apply 里赋值，取不到就退回按字符估算。 */
+let METER_GETTER = null;
+
+/** 把标记压到第一个文本块前面；没有文本块就在最前面插一个。 */
+function tagFirstTextBlock(content, tag, insertIfMissing = true) {  if (typeof content === 'string') return Object.freeze([Object.freeze({ type: 'text', text: `${tag}\n${content}` })]);
+  const blocks = Array.isArray(content) ? content.slice() : [];
+  const at = blocks.findIndex(
+    (block) => block !== null && typeof block === 'object' && block.type === 'text' && typeof block.text === 'string',
+  );
+  if (at < 0) {
+    if (!insertIfMissing) return content;
+    blocks.unshift({ type: 'text', text: tag });
+  } else blocks[at] = { ...blocks[at], text: `${tag}\n${blocks[at].text}` };
+  return Object.freeze(blocks);
+}
+
+/** 标记里的体积：小数字原样，大的收成 k（1.2k），够判断"值不值得压"就行。 */
+function tagTokenText(tokens) {
+  const n = Number(tokens);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  if (n < 1000) return String(Math.round(n));
+  const k = n / 1000;
+  return `${k >= 10 ? Math.round(k) : Math.round(k * 10) / 10}k`;
+}
+
+/**
+ * 给消息加标记：只给 user / tool / system 打，assistant 与 developer 不打。
+ * 标记形如 [#812 1.2k]：编号 + 这条消息的体积，省掉为了算体积再扫一遍节点表。
+ * 系统提示词不在 messages 里（是请求的独立字段），所以这里碰不到它；
+ * 历史里落盘的 system 节点照打。
+ * 不给 assistant 打标：模型能看到的编号就只有「外部输入」和「工具结果」两类，
+ * 既不会模仿自己的前缀，选出来的区间也天然落在步骤边界上。
+ * user / tool：允许在最前面插一个纯文本块（外部输入，补块不影响语义）；
+ * system 只在已有文本块时前置标记，避免塞进只接受字符串的 system 位。
+ */
+function taggedMessage(message, seq, tokens) {
+  if (message === null || typeof message !== 'object') return message;
+  const role = message.role;
+  if (role !== 'user' && role !== 'tool' && role !== 'system') return message;
+  const insertIfMissing = role === 'user' || role === 'tool';
+  const size = tagTokenText(tokens);
+  const tag = size.length > 0 ? `[#${seq} ${size}]` : `[#${seq}]`;
+  return Object.freeze({ ...message, content: tagFirstTextBlock(message.content, tag, insertIfMissing) });
+}
+
+/** 每个会话一份「已打标消息」缓存：消息不可变，同一个 seq 的标记结果复用同一个对象。 */
+const SEQ_TAG_CACHE = new WeakMap();
+
+/**
+ * 给这一次请求真正的消息列表打标。
+ * 直接在 pre-step 拿到的 decision.messages 上改，不依赖谁去调 session.deriveMessages；
+ * seq 用 surface 节点（和 scan_context / compact_context 同源），先按对象身份匹配，
+ * 匹配不到再按 message.id 兜底（有的路径会复制消息对象，身份就不成立了）。
+ */
+function tagRequestMessages(session, messages) {
+  const none = { messages, tagged: 0, reason: 'no-session' };
+  if (session === null || typeof session !== 'object') return none;
+  if (!Array.isArray(messages) || messages.length === 0) return { ...none, reason: 'no-messages' };
+  const nodes = session.surface?.nodes;
+  if (!Array.isArray(nodes) || nodes.length === 0) return { ...none, reason: 'no-nodes' };
+  const seqOf = new WeakMap();
+  const byId = new Map(); // message.id -> seq，重复 id 一律作废（不可靠）
+  const dupIds = new Set();
+  for (const seq of nodes) {
+    let message;
+    try {
+      message = session.deriveEventMessage(session.log[seq]);
+    } catch {
+      continue;
+    }
+    if (message === null || message === undefined || typeof message !== 'object') continue;
+    seqOf.set(message, seq);
+    const id = message.id;
+    if (typeof id !== 'string' || id.length === 0) continue;
+    if (byId.has(id)) dupIds.add(id);
+    else byId.set(id, seq);
+  }
+  let cache = SEQ_TAG_CACHE.get(session);
+  if (cache === undefined) {
+    cache = new WeakMap();
+    SEQ_TAG_CACHE.set(session, cache);
+  }
+  // 体积表按需构建：一次 measureNodes 拿到全部节点体积，命中不了就打不带体积的标记。
+  let tokenBySeq = null;
+  const tokensOf = (seq) => {
+    if (tokenBySeq === null) {
+      tokenBySeq = new Map();
+      try {
+        const meter = typeof METER_GETTER === 'function' ? METER_GETTER() : undefined;
+        for (const node of measureNodes(meter, session)) {
+          tokenBySeq.set(node.seq, node.tokens ?? node.heuristicTokens ?? 0);
+        }
+      } catch {
+        /* 量不到体积就只打编号 */
+      }
+    }
+    return tokenBySeq.get(seq) ?? 0;
+  };
+  let hits = 0;
+  const out = messages.map((message) => {
+    if (message === null || typeof message !== 'object') return message;
+    const seq = seqOf.get(message)
+      ?? (typeof message.id === 'string' && !dupIds.has(message.id) ? byId.get(message.id) : undefined);
+    if (seq === undefined) return message;
+    const cached = cache.get(message);
+    if (cached !== undefined) {
+      hits += 1;
+      return cached;
+    }
+    const tagged = taggedMessage(message, seq, tokensOf(seq));
+    if (tagged !== message) {
+      cache.set(message, tagged);
+      hits += 1;
+    }
+    return tagged;
+  });
+  return { messages: hits === 0 ? messages : out, tagged: hits, reason: hits === 0 ? 'no-match' : 'ok' };
+}
+
+/** 诊断日志：只记关键节点，便于确认标记是否真的装上了。 */
+function seqLog(line) {
+  try {
+    fs.appendFileSync(path.join(os.homedir(), '.dsh', 'seq-tagger.log'), `${new Date().toISOString()}  ${line}\n`);
+  } catch {
+    /* 日志失败不影响主流程 */
+  }
+}
+
+/**
+ * 装一次覆盖（每个会话首次请求时装），之后每次 deriveMessages 都带上编号。
+ * 这是唯一可靠的挂点：agent-loop 发请求前调 session.deriveMessages() 取完整历史。
+ */
+function installSeqTagger(session) {
+  if (session === null || typeof session !== 'object') return;
+  if (session[SEQ_TAGGER] === true || typeof session.deriveMessages !== 'function') return;
+  const original = session.deriveMessages;
+  let first = true;
+  session[SEQ_TAGGER] = true;
+  session.deriveMessages = function deriveMessagesWithSeq() {
+    const messages = original.call(this);
+    const result = tagRequestMessages(this, messages);
+    if (first) {
+      first = false;
+      seqLog(`deriveMessages ${String(this.id ?? '')} 消息 ${messages.length} 条，命中 ${result.tagged}（${result.reason}）`);
+    }
+    return result.messages;
+  };
+  seqLog(`tagger installed for session ${String(session.id ?? '')}`);
+}
 
 // ---- 面板可改的设置（目前只有阈值）：存成 JSON，重启后仍然有效 -------------
 const SETTINGS_FILE = path.join(
@@ -419,7 +623,7 @@ function locateFailure(session, label, kind, hits, poolSize, context) {
       + '（已排除会被重新注入的上下文，以及最近的自有工具调用记录）。\n'
       + '字面量匹配是子串，空白/换行/行号前缀/全角差异都已自动容忍，不需要转义。\n'
       + '可执行的动作：\n'
-      + '  1) 从你记得的原文里取 12–24 个字的片段（节点开头最稳，别用太短的常见短语）；\n'
+      + '  1) 把片段写成结构化正则：开头锚定并带长度量词 re:^\\s*<你记得的开头>{12,}，或前后缀夹逼 re:^<前缀>[\\s\\S]{12,60}<后缀>；\n'
       + '  2) 片段不要跨越节点边界，要落在同一个节点内部；\n'
       + '  3) 避开之前定位失败说明里出现过的短语——那些短语现在同时存在于多个节点里；\n'
       + '  4) 若这一端本来就不该由内容定位，试另一端的唯一片段，再取它附近的平衡切点。',
@@ -804,13 +1008,29 @@ function messageTokens(meter, message, fallbackText) {
   return roughTokens(fallbackText);
 }
 
-/** surface 节点体积表：[{seq, kind, tokens, heuristicTokens}] */
+/** surface 节点体积表：[{seq, kind, tokens, heuristicTokens}]
+ *
+ *  口径：meter.measure() 的节点体积是按固定文字密度估的（estimateMessage），
+ *  中文、代码这类内容会被系统性低估，而 totalTokens 是锚定到 provider 真实
+ *  usage 的（UI 面板显示的也是它）。直接报节点估算值会和面板差一倍上下，
+ *  所以这里用 totalTokens / 节点估算总和 的比例把各节点摊到锚定口径，
+ *  使「节点体积之和 ≈ 面板总量」。比例落在合理区间外就不摊（避免一次畸变把全部数字带歪）。
+ */
 function measureNodes(meter, session) {
   let nodes;
+  let scale = 1;
   if (meter && typeof meter.measure === 'function') {
     try {
       const measurement = meter.measure(session);
-      if (measurement && Array.isArray(measurement.nodes)) nodes = measurement.nodes;
+      if (measurement && Array.isArray(measurement.nodes)) {
+        nodes = measurement.nodes;
+        const estimated = nodes.reduce((sum, node) => sum + Number(node.tokens ?? node.heuristicTokens ?? 0), 0);
+        const anchored = Number(measurement.totalTokens);
+        if (estimated > 0 && Number.isFinite(anchored) && anchored > 0) {
+          const ratio = anchored / estimated;
+          if (ratio >= 1 && ratio <= 6) scale = ratio;
+        }
+      }
     } catch {
       /* 落到兜底 */
     }
@@ -823,14 +1043,22 @@ function measureNodes(meter, session) {
   }
   // kind 供注入清单标注节点类型（u/a/t/s/d）；meter 的节点表可能不带，从事件补。
   return nodes.map((node) => {
-    if (node.kind !== undefined) return node;
+    const scaled = scale === 1
+      ? node
+      : {
+        ...node,
+        tokens: Math.round(Number(node.tokens ?? node.heuristicTokens ?? 0) * scale),
+        heuristicTokens: Math.round(Number(node.heuristicTokens ?? node.tokens ?? 0) * scale),
+        scale,
+      };
+    if (scaled.kind !== undefined) return scaled;
     let kind;
     try {
       kind = session.eventAt(node.seq)?.type;
     } catch {
       /* 越界则留空，清单显示 ? */
     }
-    return { ...node, kind };
+    return { ...scaled, kind };
   });
 }
 
@@ -898,30 +1126,132 @@ function validateSpan(session, start, end) {
   };
 }
 
+/** 把 `[#812]` / `[#812 1.2k]` / `#812` / `812` / 812 都解析成 seq 整数。 */
+function parseSeqRef(value, label) {
+  if (typeof value === 'number') {
+    if (!Number.isInteger(value) || value < 0) throw new Error(`${label} 必须是节点编号整数：${value}`);
+    return value;
+  }
+  const text = String(value).trim();
+  const match = /^\[?\s*#?\s*(\d+)\s*(?:[·\s,/]\s*\d+(?:\.\d+)?\s*[kKmM]?)?\s*\]?$/.exec(text);
+  if (match === null) {
+    throw new Error(`${label} 不是节点编号：${JSON.stringify(text)}；写法是 812 或 "[#812]"，也可以整段抄 "[#812 1.2k]"`);
+  }
+  return Number(match[1]);
+}
+
 /**
- * 解析多段参数：给了 `segments` 就是多段模式，返回 [{from, to, summary}]；
- * 没给返回 undefined（走单段）。两种写法不混用，混了就报错而不是猜。
+ * 按节点编号定位区间（默认定位方式）。
+ * start 必给；end 缺省时取「保留尾部之前最后一个平衡边界」。
+ */
+function resolveSeqSpan(session, startValue, endValue, cfg) {
+  const nodes = session.surface.nodes;
+  const notes = [];
+  const start = parseSeqRef(startValue, 'start');
+  const startIdx = nodes.indexOf(start);
+  if (startIdx === -1) {
+    throw new Error(
+      `start #${start} 不在当前 surface 上：它可能已被之前的压缩折叠，或属于别的会话；`
+      + `当前区间是 #${nodes[0]} … #${nodes[nodes.length - 1]}`,
+    );
+  }
+  let end;
+  if (endValue === undefined || endValue === null || endValue === '') {
+    const keep = Math.max(0, Math.floor(Number(cfg.keepTailNodes) || 0));
+    let idx = Math.min(nodes.length - 1, nodes.length - keep - 1);
+    while (idx > startIdx && !toolPairingBalancedAfter(session, nodes[idx])) idx -= 1;
+    if (idx <= startIdx && !toolPairingBalancedAfter(session, nodes[idx])) {
+      throw new Error(`没给 end，而 #${nodes[idx]} 之前找不到可用的平衡边界；请显式给 end`);
+    }
+    end = nodes[idx];
+    notes.push(`没给 end，默认终点取保留尾部之前的最后一个平衡边界 #${end}`);
+  } else {
+    end = parseSeqRef(endValue, 'end');
+  }
+  const endIdx = nodes.indexOf(end);
+  if (endIdx !== -1 && endIdx < startIdx) {
+    throw new Error(
+      `start #${start} 在 surface 上位于 end #${end} 之后：seq 是节点创建号，不代表对话顺序。`
+      + `若你想压的就是这两个号之间的区间，互换即可：start: ${end}、end: ${start}`,
+    );
+  }
+  // 自动吸附：给的号落在某一步中间时，往前/往后挪到最近的合法边界，而不是直接报错。
+  const snap = cfg.snapSpan !== false;
+  let s = startIdx;
+  const originalEndIdx = endIdx === -1 ? nodes.length - 1 : endIdx;
+  let e = originalEndIdx;
+  if (snap) {
+    const originalStart = nodes[s];
+    while (s < e && !toolPairingBalancedBefore(session, nodes[s])) s += 1;
+    if (s !== startIdx) notes.push(`起点 #${originalStart} 不在平衡边界上，已自动后移到 #${nodes[s]}`);
+    const originalEnd = nodes[e];
+    while (e > s && !toolPairingBalancedAfter(session, nodes[e])) e -= 1;
+    if (e !== originalEndIdx) notes.push(`终点 #${originalEnd} 不在平衡边界上，已自动前移到 #${nodes[e]}`);
+    if (!toolPairingBalancedBefore(session, nodes[s]) || !toolPairingBalancedAfter(session, nodes[e])) {
+      throw new Error(`#${start} … #${end} 之间吸附后仍找不到合法的平衡边界；请换一个起点或终点`);
+    }
+    // 系统提示词头部不能进区间：起点若框住了它，就往后挪一格。
+    const headSeq = protectedHeadSeq(session);
+    if (headSeq !== undefined) {
+      const headIdx = nodes.indexOf(headSeq);
+      if (headIdx !== -1 && headIdx >= s && headIdx <= e) {
+        s = Math.max(s, headIdx + 1);
+        while (s < e && !toolPairingBalancedBefore(session, nodes[s])) s += 1;
+        if (headIdx >= s) throw new Error(`区间起点只能落在系统提示词头部 #${headSeq} 之后；请把 start 给得更靠后`);
+        notes.push(`起点原本框住了系统提示词头部 #${headSeq}，已自动后移到 #${nodes[s]}`);
+      }
+    }
+  }
+  return { start: nodes[s], end: nodes[e], notes };
+}
+
+/**
+ * 单段/多段统一入口：给了 start 就按节点编号定位（默认），
+ * 否则按 from/to 内容定位（备用）。
+ */
+function resolveSegmentRange(session, seg, cfg) {
+  if (seg.start !== undefined || seg.end !== undefined) {
+    if (seg.start === undefined) throw new Error('end 要与 start 一起给：start 定位区间起点，写消息开头的 [#N] 编号');
+    return resolveSeqSpan(session, seg.start, seg.end, cfg);
+  }
+  if (seg.from === undefined || seg.to === undefined) {
+    throw new Error('需要 start/end（节点编号，默认方式）或 from/to（内容定位）来指定区间');
+  }
+  return locateSpan(session, seg.from, seg.to, { toolName: cfg.toolName });
+}
+
+/**
+ * 解析多段参数：给了 `segments` 就是多段模式，返回 [{start, end, summary}] 或 [{from, to, summary}]；
+ * 没给返回 undefined（走单段）。两种定位写法不混用，混了就报错而不是猜。
  */
 function parseSegmentArgs(a) {
   const raw = a.segments;
   if (raw === undefined || raw === null) return undefined;
   if (!Array.isArray(raw)) throw new Error('segments 必须是数组：[{from, to, summary}, …]');
   if (raw.length === 0) throw new Error('segments 不能是空数组：多段压缩至少给一段');
-  if (a.from !== undefined || a.to !== undefined || a.summary !== undefined) {
-    throw new Error('segments 与单段参数（from/to/summary）二选一');
+  if (
+    a.from !== undefined || a.to !== undefined || a.start !== undefined || a.end !== undefined || a.summary !== undefined
+  ) {
+    throw new Error('segments 与单段参数（start/end 或 from/to，加 summary）二选一');
   }
   return raw.map((item, index) => {
     const at = `segments[${index}]`;
     if (item === null || typeof item !== 'object' || Array.isArray(item)) {
-      throw new Error(`${at} 必须是 {from, to, summary}`);
+      throw new Error(`${at} 必须是 {start, end, summary} 或 {from, to, summary}`);
     }
     const summary = typeof item.summary === 'string' ? item.summary.trim() : '';
     if (summary.length === 0) throw new Error(`${at}.summary 不能为空：这一段的检查点内容就是你写的摘要`);
-    if (item.from === undefined || item.to === undefined) {
-      throw new Error(`${at} 需要 from 和 to：按内容定位区间两端（字面文本，空白折叠）`);
+    const hasSeq = item.start !== undefined || item.end !== undefined;
+    const hasText = item.from !== undefined || item.to !== undefined;
+    if (hasSeq && hasText) {
+      throw new Error(`${at} 的 start/end（节点编号）与 from/to（内容定位）二选一，不要混用`);
     }
-    if (item.start !== undefined || item.end !== undefined) {
-      throw new Error(`${at} 不再支持 start/end：用 from/to 按内容定位`);
+    if (!hasSeq && !hasText) {
+      throw new Error(`${at} 需要 start/end（节点编号，默认方式）或 from/to（内容定位）`);
+    }
+    if (hasSeq) {
+      if (item.start === undefined) throw new Error(`${at}.start 不能为空：end 要与 start 一起给`);
+      return { start: item.start, end: item.end, summary };
     }
     return { from: String(item.from), to: String(item.to), summary };
   });
@@ -1021,21 +1351,51 @@ function measurePressure(meter, session, cfg) {
 }
 
 /**
- * 注入/面板共用的提示文本：模板 + 「压多少」+ from/to 写法。
- * 不给节点清单、不给预切区间：压哪段由模型凭自己的对话上下文判断，
- * 定位片段从自己记得的原文里取（记住的原文开头就是节点开头）。
- * 模板里的 {pct} {tokens} {threshold} 由调用方传入，未传则保留原样。
+ * 阈值触发后的「压缩指南」：为什么要压、压哪些、怎么压。
+ * 完整版每个会话只注入一次（指南本身会留在历史里，重复注入等于自己制造冗余）；
+ * 之后同一会话再越档，只补一行「继续压」的提醒。
  */
-function buildHintText(session, cfg, meter, pct, tokens, threshold) {
+const COMPACT_GUIDE_WHY = [
+  '## 为什么压',
+  '上下文越长，旧内容越稀释注意力：被推翻的方案、过期的文件内容、无关的日志会和当前证据争同样的注意力。压缩是把「已被后续信息取代」的部分折叠成摘要，让当前任务重新成为最近、最相关的证据——省 token 只是副产品。',
+  '判据：重建成本 × 重建概率 < 释放 token × 剩余轮数 才划算。占用率只是窗口松紧的度量，决定权在每段内容的未来用途：某段已被取代、继续留着抢注意力时，折叠它就划算；某段是当前证据时，留着它更划算。',
+].join('\n');
+
+const COMPACT_GUIDE_WHAT = [
+  '## 压哪些',
+  '该压：①结论已被后续复述的探索与试错；②重复确认与寒暄；③被取代的旧方案（摘要里注明「已废弃」）；④结论已提取的大块工具输出（源码/日志/目录树）；⑤旧的检查点本身（合并时保住旧摘要的结论）。',
+  '宜留：①用户明确要求（不可重建，压掉就是永久丢约束）；②当前任务依赖的原始证据——报错原文、端口/行号/版本等数字；③下一步要动手的那份文件内容（重建要重读）；④尚未收敛的失败现场。',
+  '这两组是被判据挑出来的典型例子，真正决定压不压的是「这段内容未来还会不会被用到、重建它要花多少」。',
+  '「最旧最大」只在「旧即无用」时成立：最旧那段可能是唯一没被复述的需求，最大那段可能是刚读进来马上要用的文件。',
+].join('\n');
+
+const COMPACT_GUIDE_HOW = [
+  '## 怎么压',
+  '逐字保留：文件路径、命令原文、报错原文、数字、结论性判断、用户的原话要求。可以丢：寒暄、重复确认、被推翻的中间方案、成功命令的输出细节（留「成功 + 关键值」）。',
+  '防失真：①不把猜测写成事实（写「已验证：X」，不写「应该是 X」）；②保留否定限定词（「不要用 A」不能写成「考虑过 A」）；③区分时效（旧方案标已废弃，别让旧结论冒充现行结论）。',
+  '自检五问：下一步只读这段摘要能直接开始吗？有没有把没验证的写成已验证？路径/命令/数字丢了吗？否定性要求被写成中性描述了吗？有没有引用被删掉的原话（应当没有）？',
+  '粒度：按主题切，别把不相关的内容硬拼成一段，也不必为了「小步安全」把同一主题拆成好几次调用——单次释放量与一次压几段，取决于你对重建成本的判断。',
+  '边界：工具会校验并拒绝劈开工具调用与结果的区间（切开会让模型以为证据缺失而重跑，比不压更糟）；踩到时报错会指出该往哪边挪，不需要预先算准。',
+].join('\n');
+
+function buildHintText(session, cfg, meter, pct, tokens, threshold, fullGuide = true) {
   const template = effectiveTemplate(cfg)
     .replaceAll('{pct}', pct === null || pct === undefined ? '{pct}' : String(pct))
     .replaceAll('{tokens}', tokens === null || tokens === undefined ? '{tokens}' : String(tokens))
     .replaceAll('{threshold}', threshold === null || threshold === undefined ? '{threshold}' : String(threshold));
-  return [
+  const locate =
+    '## 定位\n'
+    + `用 ${cfg.toolName}：默认按节点编号——消息开头 [#N 体积] 里的 N 就是编号，后面的体积是这条消息多大。单段写 start / end（end 可省略 = 保留尾部之前的最后一个平衡边界）；多段写 segments: [{start, end, summary}, …] 一次压掉。`
+    + '编号只用你在对话里真实见到的，不要推算；已被折叠的编号会失效并报错告知当前区间。'
+    + '端点落在工具步中间时会自动吸附到最近的合法边界（报错或 notes 会说明移到了哪个号）。'
+    + '内容锚点 from/to 只在端点没有编号时兜底，且必须写成带结构的复杂正则（开头锚定、或前后缀用 [\\s\\S]{12,60} 夹住中间）。';
+  const brief = [
     template,
-    `压多少：凭你自己的对话上下文判断，挑最旧、最大、已被后续信息取代的连续段；同一主题能一次压掉的别拆成多次小折；压完看占用，仍在阈值之上就继续下一段，回到阈值下方就停——不必追求某个固定比例。优先压：大块 tool 输出（源码、目录树、长日志）、已完成任务的探索与试错、重复确认；必须留：当前任务的决定、文件路径、命令、报错原文、用户明确要求。`,
-    `定位：不用节点清单，from/to 直接从你记得的原文里取片段。写法按可靠度三选一（记不住就照抄工具描述里的模板）：①开头锚定（首选）re:^\\s*<某节点真实的开头 12–24 字>{12,}——节点开头=原文，别处的复述都在行中间，锚定后不误命中；②前后缀夹逼 re:^<前缀>[\\s\\S]{12,60}<后缀>，唯一性由前后缀共同保证；③字段级：拿报错原文里的编号/路径/命令参数当锚。别写给所有节点都成立的短片段，别用 re:^.* 贪心。两端若落在工具步中间会自动收敛到最近的安全切点；多段用 segments 数组一次压掉。`,
+    '前一份压缩指南仍然适用；这次是否继续压、压多少，按其中的判据自己判断。',
+    locate,
   ].join('\n');
+  if (!fullGuide) return brief;
+  return [template, COMPACT_GUIDE_WHY, COMPACT_GUIDE_WHAT, COMPACT_GUIDE_HOW, locate].join('\n');
 }
 
 /**
@@ -1254,14 +1614,18 @@ export function apply(ctx, config) {
     }
     return meterCache;
   };
+  METER_GETTER = meterOf;
 
-  // ---- 工具 1：扫描 surface ----------------------------------------------
-  ctx.tools.register({
+  // ---- 工具 1：扫描 surface（默认不注册）---------------------------------
+  // 模型能从消息开头的 [#N 体积] 直接拿编号，扫描工具给的是同源但更贵的一份清单：
+  // 每次用它定位都要往上下文里灌一次节点列表，容易变成「先扫再压」的固定动作。
+  if (cfg.scanTool) ctx.tools.register({
     name: cfg.scanToolName,
     description:
-      '列出当前会话 surface 上的每个节点：seq、事件类型、估算 token 体积、内容预览。' +
-      '压缩上下文前先用它挑出一段可折叠的区间，按内容里独特的一段写 from/to 交给 compact_context（字面量匹配，空白折叠，不用转义；from 匹配起点、to 匹配终点）。' +
-      '能压就多压：优先一次把多段写成 segments 一起传进去，而不是一段一段来。' +
+      '列出当前会话 surface 上的每个节点：seq、事件类型、token 体积、内容预览。体积与 ratio 按 dsh 面板同一口径（meter 测得的整条请求 token，节点体积按此摊平），可直接跟面板数字对照。' +
+      '压缩上下文前可先用它确认区间：`recommendedStart` / `recommendedEnd`（以及 compressible 里的 start/end）就是可以直接填进 compact_context 的节点编号。' +
+      '也可以直接用你自己看到的 [#N] 编号：start 写区间起点、end 写终点；端点没有编号时才退回 from/to 内容锚点（字面量匹配，空白折叠）。' +
+      '多段可以一次用 segments 传进来，省一次往返；也能一段一段来，按你自己的判断。' +
       '工具调用与工具结果必须成对落在区间内，否则压缩会被拒绝。',
     parameters: {
       type: 'object',
@@ -1276,10 +1640,13 @@ export function apply(ctx, config) {
       schema: {
         type: 'object',
         properties: {
-          totalTokens: { type: 'number' },
+          totalTokens: { type: 'number', description: '各节点体积之和（已按面板口径摊平，约等于面板的「已用」总量）' },
+          measuredTokens: { type: 'number', description: 'meter 直接测得的整条请求 token（与面板一致，含系统提示词与工具定义）' },
+          ratio: { type: 'number', description: 'measuredTokens / contextWindowTokens，即面板显示的占用比例（0–1）' },
+          windowTokens: { type: 'number', description: '上下文窗口 token 数' },
           nodeCount: { type: 'number' },
-          recommendedStart: { type: 'integer', description: '推荐区间起点（仅展示用，压缩请用 from/to）；0 表示当前没有可压缩区间' },
-          recommendedEnd: { type: 'integer', description: '推荐区间终点（仅展示用，压缩请用 from/to）；0 表示当前没有可压缩区间' },
+          recommendedStart: { type: 'integer', description: '推荐区间起点编号：可直接作为 compact_context 的 start；0 表示当前没有可压缩区间' },
+          recommendedEnd: { type: 'integer', description: '推荐区间终点编号：可直接作为 compact_context 的 end；0 表示当前没有可压缩区间' },
           nodes: { type: 'array', items: { type: 'object', additionalProperties: true } },
           compressible: { type: 'array', items: { type: 'object', additionalProperties: true } },
         },
@@ -1318,9 +1685,13 @@ export function apply(ctx, config) {
         });
       }
       const candidateEnd = nodes.length - 1 - keep;
+      const pressure = measurePressure(meter, session, cfg);
       return {
         nodeCount: nodes.length,
         totalTokens,
+        measuredTokens: pressure.tokens,
+        ratio: pressure.ratio,
+        windowTokens: cfg.contextWindowTokens,
         keepTailNodes: keep,
         recommendedStart: nodes.length > keep + 1 ? nodes[0] : 0,
         recommendedEnd: candidateEnd > 0 ? nodes[candidateEnd] : 0,
@@ -1335,28 +1706,33 @@ export function apply(ctx, config) {
     name: cfg.toolName,
     description:
       '把 surface 上的一段或几段区间各替换成一个检查点：你写的 summary 就是该段替换后保留的全部内容，被替换的节点从此不再进入上下文。' +
-      '单段用 from/to/summary 按内容定位；多段用 segments: [{from, to, summary}, …]，一次调用把多段一起折掉，不用反复调用。' +
-      '定位片段三种写法，按可靠度排序（都要唯一命中一端节点；不用节点清单，从你自己的对话记忆里取片段）：\n' +
-      '①开头锚定（首选）：re:^\\s*<节点开头的 12–24 个字>{12,}——节点开头就是原文，别处的复述都在行中间，锚定后不会误命中。反例 re:^The file（多份同名报告同以此开头，必多命中）；正例 re:^\\s*The file E:\\\\Ai\\\\退注意力\\\\packages\\\\dsh-context-compact\\\\lib\\\\index\\.js has been updated。\n' +
-      '②前后缀夹逼：re:^<前缀>[\\s\\S]{12,60}<后缀>，唯一性由前后缀共同保证，中间用 [\\s\\S]{12,60} 吸收正文。反例 re:^.*index\\.js.*updated（.* 跨节点贪心）；正例 re:^\\s*<path>[^\\n]{0,90}index\\.js</path>\\s*<type>file</type>。\n' +
-      '③字段级：拿报错编号、路径、命令参数当锚，比整句稳——re:^\\s*Error: 定位失败：from。\n' +
-      '不带 re: 时按字面文本匹配：给 12–24 个连续字符，不用转义，空白/换行/全角/行号前缀差异自动容忍；片段来自你记得的原文，不用按预览逐字抄。字面文本若落在唯一节点开头会优先选它；host 会把原文与折叠成一行去行号的文本各试一次，只是兜底别依赖。多命中会报错并列候选，不自动选。' +
-      '规则：①每段两端必须是平衡边界；②摘要必须明显短于被替换内容；③区间里可以包含之前生成的检查点（可以再次压缩）；' +
+      '定位默认按**节点编号**：消息开头那个 `[#N 体积]` 的 N 就是编号（后面的体积告诉你这一段多大），单段写 start（起点编号）/ end（终点编号），多段写 segments: [{start, end, summary}, …]，一次调用把多段一起折掉。' +
+      'end 可以不给：默认取「保留尾部之前最后一个平衡边界」。编号必须来自当前对话里真实出现过的 `[#N]`，不要自己推算；已被折叠的节点号会失效，用它会报错并告知当前区间。' +
+      'start/end 落在工具步中间时会自动吸附到最近的合法平衡边界，notes 里会写明移到了哪个号，不需要自己算边界。' +
+      '区间里夹着「每步会被自动重新注入」的上下文（system-reminder、runtime context 快照）时，工具会把它们留在原处、把两侧各自成段一次压完：你只管给整段 start/end，一次调用就够，不用自己找缝隙分多次。' +
+      '备用定位是内容锚点 from/to（当端点没有编号时用，例如压缩区间正好起于系统提示词头部）：必须写成带上下文结构的复杂正则——禁止把一句话原样贴上去，要用 [\\\\s\\\\S]{n,m} 这类变长量词吸收中间正文、用开头/结尾原文夹住两端，或带长度量词把开头钉死；' +
+      '①开头锚定：re:^\\\\s*<你记得的某节点真实开头 12–24 字>{12,}；②前后缀夹逼：re:^<你记得的前缀>[\\\\s\\\\S]{12,60}<你记得的后缀>；③字段级：re:^<字段标签>[^\\\\n]{0,60}<值>。' +
+      'spec 里两种写法不要混用；多命中会报错并列候选，不自动选。' +
+      '规则：①每段两端必须是平衡边界（不能劈开 tool-call 与结果）；②摘要必须明显短于被替换内容；③区间里可以包含之前生成的检查点（可以再次压缩）；' +
       '④当前轮次也可以压缩（只要区间结束于一个已闭合的步骤）；⑤压缩后你自己的摘要不能引用被删掉的原话，只保留结论、路径、命令与失败现场。',
     parameters: {
       type: 'object',
       properties: {
-        from: { type: 'string', description: '单段模式：定位起点节点。首选 re:^\\s*<你记得的节点开头 12–24 字>{12,}（锚定原文开头，别处复述不误命中）；或 re:^<前缀>[\\s\\S]{12,60}<后缀>（前后缀夹逼）；或 12–24 个连续字面字符（不用转义，空白/全角/行号差异自动容忍，落在唯一节点开头会优先选）。反例：re:^The file 太短必多命中、.*index.* 跨节点贪心、给所有节点都成立的短片段。多命中报错并列候选，不自动选' },
-        to: { type: 'string', description: '单段模式：定位终点节点，只在 from 命中的节点之后查找。写法同 from，须在 from 之后唯一命中；若命中只出现在 from 之前会提示写反' },
+        start: { anyOf: [{ type: 'integer' }, { type: 'string' }], description: '单段模式（默认定位方式）：区间起点的节点编号，可整段抄消息开头的 [#N 体积]，也接受 812 这种裸数字。必须是当前 surface 上还存在的节点；落在工具步中间会自动吸附' },
+        end: { anyOf: [{ type: 'integer' }, { type: 'string' }], description: '单段模式：区间终点的节点编号，写法同 start。可省略——省略时自动取保留尾部之前的最后一个平衡边界' },
+        from: { type: 'string', description: '备用定位：单段模式的起点内容锚点，只在端点没有编号时用。必须写带结构的复杂正则（见工具说明），禁止单句字面片段。与 start 二选一' },
+        to: { type: 'string', description: '备用定位：单段模式的终点内容锚点，写法同 from，须在 from 之后唯一命中' },
         summary: { type: 'string', description: '单段模式：检查点正文，替代被压缩区间的全部内容' },
         segments: {
           type: 'array',
-          description: '多段模式：一次调用折多段，每段自带 from/to 加 summary；与单段参数二选一',
+          description: '多段模式：一次调用折多段，每段自带 start/end（或 from/to）加 summary；与单段参数二选一',
           items: {
             type: 'object',
             properties: {
-              from: { type: 'string', description: '这一段起点：re:^\\s*<节点开头 12–24 字>{12,} 或 12–24 字面字符，须唯一命中' },
-              to: { type: 'string', description: '这一段终点：写法同 from，须在 from 之后唯一命中' },
+              start: { anyOf: [{ type: 'integer' }, { type: 'string' }], description: '这一段起点的节点编号（消息开头的 [#N]）' },
+              end: { anyOf: [{ type: 'integer' }, { type: 'string' }], description: '这一段终点的节点编号；可省略' },
+              from: { type: 'string', description: '备用：这一段起点内容锚点，写法同单段 from' },
+              to: { type: 'string', description: '备用：这一段终点内容锚点' },
               summary: { type: 'string', description: '这一段的检查点正文' },
             },
             required: ['summary'],
@@ -1417,10 +1793,12 @@ export function apply(ctx, config) {
 
       const summaryText = typeof a.summary === 'string' ? a.summary.trim() : '';
       if (summaryText.length === 0) throw new Error('summary 不能为空：检查点的全部内容就是你写的这段摘要');
-      if (a.from === undefined || a.to === undefined) {
-        throw new Error('from 与 to 要一起给：from 定位区间起点、to 定位终点，按字面文本匹配节点全文（空白折叠），要正则写 re: 前缀；要压多段请用 segments');
+      const span = resolveSegmentRange(session, a, cfg);
+      // 区间里夹着会被自动重新注入的节点：留在原处、两侧各自成段，一次调用压完整个区间。
+      const autoSegments = splitSpanAtProtected(session, span.start, span.end, summaryText);
+      if (autoSegments !== undefined) {
+        return performFoldMany(session, autoSegments, common);
       }
-      const span = locateSpan(session, a.from, a.to, { toolName: cfg.toolName });
 
       return performFold(session, span.start, span.end, {
         ...common,
@@ -1460,6 +1838,70 @@ export function apply(ctx, config) {
       if (toolPairingBalancedAfter(session, nodes[i])) return { start, end: nodes[i] };
     }
     return { start, end: nodes[lo] };
+  }
+
+  // 同一次折叠里，除承载完整摘要的那一段外，其余段的检查点只留一句指路。
+  const COMPANION_SUMMARY =
+    '（同一批折叠的伴随段：完整摘要写在同一批的另一条检查点里，本段是被一并折掉的旧内容。）';
+
+  /**
+   * 区间里夹着「每类可再生注入里最新的一条」时，把这些节点留在原处、把两侧各自成段：
+   * 调用方给的是一个整区间，工具内部切成几段提交，所以一次调用就能压完，不必自己找缝隙。
+   * 返回 undefined 表示区间里没有保护节点（或只剩一段），按单段照常折。
+   */
+  function splitSpanAtProtected(session, start, end, summaryText) {
+    const nodes = session.surface.nodes;
+    const lo = nodes.indexOf(start);
+    const hi = nodes.indexOf(end);
+    if (lo === -1 || hi === -1 || lo > hi) return undefined;
+    const protectedSeqSet = new Set([...latestRegenerableInjectionSeqs(session).values()]);
+    const raw = [];
+    let from = lo;
+    for (let i = lo; i <= hi; i += 1) {
+      if (!protectedSeqSet.has(nodes[i])) continue;
+      if (i > from) raw.push([from, i - 1]);
+      from = i + 1;
+    }
+    if (from <= hi) raw.push([from, hi]);
+    if (raw.length === 0) return undefined;
+
+    const pieces = [];
+    for (const [rawStart, rawEnd] of raw) {
+      let s = rawStart;
+      let e = rawEnd;
+      while (s < e && !toolPairingBalancedBefore(session, nodes[s])) s += 1;
+      while (e > s && !toolPairingBalancedAfter(session, nodes[e])) e -= 1;
+      if (s > e) continue;
+      pieces.push({ start: nodes[s], end: nodes[e], startIdx: s, endIdx: e });
+    }
+    if (pieces.length === 0) return undefined;
+    if (pieces.length === 1) {
+      // 整个区间连成一片（保护节点只落在两端之外），不需要切。
+      if (pieces[0].startIdx === lo && pieces[0].endIdx === hi) return undefined;
+      return [{ start: pieces[0].start, end: pieces[0].end, summary: summaryText }];
+    }
+
+    const measured = measureNodes(meterOf(), session);
+    const weightOf = (piece) => {
+      let sum = 0;
+      for (let i = piece.startIdx; i <= piece.endIdx; i += 1) {
+        const row = measured.find((node) => node.seq === nodes[i]);
+        if (row !== undefined) sum += row.tokens ?? row.heuristicTokens ?? 0;
+      }
+      return sum;
+    };
+    // 太小的一段折了不划算（minShadowTokens 会直接报错），留在原处。
+    const kept = pieces.filter((piece) => weightOf(piece) >= cfg.minShadowTokens);
+    const usable = kept.length === 0 ? pieces : kept;
+    let carry = 0;
+    for (let i = 1; i < usable.length; i += 1) {
+      if (weightOf(usable[i]) > weightOf(usable[carry])) carry = i;
+    }
+    return usable.map((piece, index) => ({
+      start: piece.start,
+      end: piece.end,
+      summary: index === carry ? summaryText : COMPANION_SUMMARY,
+    }));
   }
 
   // ---- 折叠核心：工具与面板共用同一套事务 ----------------------------------
@@ -1615,7 +2057,7 @@ export function apply(ctx, config) {
     // 逐段先过一遍边界校验：这里就会拦下越界、劈开 tool-call、框进 system 头部。
     const spans = segments.map((seg, index) => {
       try {
-        const range = locateSpan(session, seg.from, seg.to, { toolName: cfg.toolName });
+        const range = resolveSegmentRange(session, seg, cfg);
         return {
           index,
           seg: { ...seg, start: range.start, end: range.end, locateNotes: range.notes },
@@ -2099,9 +2541,17 @@ export function apply(ctx, config) {
         if (session === undefined || session === null) {
           return sendJson(res, 409, { error: `找不到活跃会话：${body?.sessionId}` });
         }
-        const start = Number(body?.start);
-        const end = Number(body?.end);
-        const hasSpan = Number.isInteger(start) && Number.isInteger(end);
+        const rawStart = Number(body?.start);
+        const rawEnd = Number(body?.end);
+        const hasSpan = Number.isInteger(rawStart) && Number.isInteger(rawEnd);
+        // 面板给的是 seq（创建号），它和 surface 位置不同序：seq 大的反而可能更靠前。
+        // 这里按位置纠正顺序，否则指令里会给出一个必然报错的 start/end 组合。
+        const nodes = session.surface.nodes;
+        const startAt = nodes.indexOf(rawStart);
+        const endAt = nodes.indexOf(rawEnd);
+        const swapped = startAt !== -1 && endAt !== -1 && startAt > endAt;
+        const start = swapped ? rawEnd : rawStart;
+        const end = swapped ? rawStart : rawEnd;
         let instruction;
         if (hasSpan) {
           const rawHead = String(previewOf(session, start) ?? '').replace(/\s+/g, ' ').trim();
@@ -2110,7 +2560,8 @@ export function apply(ctx, config) {
           const tail = rawTail.slice(0, 40);
           instruction =
             `【上下文面板】请用 ${cfg.toolName} 折叠 surface 上「${head}」到「${tail}」这段区间：`
-            + `用 from/to 按字面文本定位（不用转义：from: "${head}"、to: "${tail}"；片段取自你记得的原文，命中多个或找不到时按报错里列出的候选换一段更独特的文本）。`
+            + `直接按节点编号定位：start: ${start}、end: ${end}。`
+            + '若报错说编号已失效，再用内容锚点 from/to 兜底（必须写成结构化正则：开头锚定，或前后缀用 [\\\\s\\\\S]{12,60} 夹住中间；不要只贴一句话）。'
             + `然后写一份只保留结论、路径、命令与失败现场的摘要（语言：${cfg.summaryLanguage}；写法：${cfg.summaryStyle}）。`
             + '这只是腾地方，不要在这条消息后继续别的任务。';
         } else {
@@ -2202,9 +2653,11 @@ export function apply(ctx, config) {
   if (!cfg.injectPrompt) return;
 
   const baseRules = [
-    '上下文越长，旧内容越稀释注意力；压缩把过时对话折叠成摘要，腾出窗口给当前任务。',
-    '压缩哪些：已被后续信息取代、与当前任务无关的早期探索与试错、重复确认；保留当前任务的决定、文件路径、命令、失败现场和用户明确要求。',
-    `用 ${cfg.toolName}：不注入节点清单，压哪一段凭你自己的对话上下文判断。from/to 写法按可靠度三选一（记不住就照抄工具描述里的模板）：①开头锚定（首选）re:^\\s*<你记得的某个节点真实开头 12–24 字>{12,}，节点开头=原文、别处复述都在行中间；②前后缀夹逼 re:^<前缀>[\\s\\S]{12,60}<后缀>；③字段级：拿报错原文里的编号/路径当锚。别写给所有节点都成立的短片段，别用 re:^.* 贪心。两端若落在工具步中间会自动收敛到最近的安全切点（只会少压，不会劈开步骤）；多段用 segments 数组（同一主题能一次压掉就别拆成多次；单次段数上限、每段节点上限、最小收益门槛见工具描述，超限会被拒绝）；尾部 ${cfg.keepTailNodes} 条保留。`,
+    '上下文越长，旧内容越稀释注意力。压缩 = 把已被后续信息取代的旧内容折叠成摘要，让当前任务重新成为最近、最相关的证据；省 token 只是副产品。',
+    '判据：重建成本 × 重建概率 < 释放 token × 剩余轮数 才划算。占用率只是窗口松紧的度量，挑哪一段压的依据是每段内容以后还会不会被用到：内容构成当前任务必需证据时，压掉它就是把现成证据换成一次重读。',
+    '常见可压情形：结论已被后续复述的探索与试错、重复确认、被取代的旧方案、结论已提取的大块工具输出。常见宜留：用户明确要求、当前任务依赖的原始证据（报错原文、端口/行号/版本）、下一步要动手的文件内容、尚未收敛的失败现场。这些是被成本判据挑出来的典型例子，实际按现场权衡取舍。',
+    `工具：${cfg.toolName} 折叠「同一主题的连续段」，单段与多段（segments）都支持，可以一次折完；它会拒绝劈开工具调用与结果的区间，越界、编号失效、摘要不够短都会明确报出来。摘要里通常要留住结论、路径、命令、报错原文、数字与否定性约束，并区分事实与猜测、已废弃与现行结论。`,
+    '越过反思线时系统会附一份压缩指南供参考，压哪段、压多少以每段内容的未来用途和上面的判据为准。',
     `${cfg.requireShrink ? '摘要必须明显短于被替换内容；' : ''}摘要语言：${cfg.summaryLanguage}；写法：${cfg.summaryStyle}。压缩后只看得到摘要：路径、命令、失败现场必须写进摘要。`,
     cfg.extraRules ? `额外硬规则：${cfg.extraRules}` : '',
   ].filter((line) => line.length > 0);
@@ -2213,6 +2666,7 @@ export function apply(ctx, config) {
   // 动态段只在越过阈值时出现；占用率按 5% 分档缓存，档位没变就复用上次的文本，
   // 这样系统提示词（in-history 路由）只在跨档时追加一条，不会每步重发。
   const dynamicCache = new Map(); // sessionId -> { band, text }
+  const guideSent = new Set(); // 每个会话只注入一次完整指南，之后只补提醒
   const renderDynamic = (agent) => {
     const session = agent?.session;
     if (session === undefined || session === null) return '';
@@ -2226,8 +2680,9 @@ export function apply(ctx, config) {
     const pct = Math.floor((pressure.ratio * 100) / 5) * 5;
     if (!Number.isFinite(pct) || pct < threshold) return '';
     const cacheKey = String(session.id ?? '');
+    const fullGuide = !guideSent.has(cacheKey);
     const cached = dynamicCache.get(cacheKey);
-    if (cached !== undefined && cached.band === pct) return cached.text;
+    if (cached !== undefined && cached.band === pct && cached.full === fullGuide) return cached.text;
     const text = buildHintText(
       session,
       cfg,
@@ -2235,8 +2690,10 @@ export function apply(ctx, config) {
       pct,
       Math.floor(pressure.tokens / 100) * 100,
       threshold,
+      fullGuide,
     );
-    dynamicCache.set(cacheKey, { band: pct, text });
+    if (fullGuide) guideSent.add(cacheKey);
+    dynamicCache.set(cacheKey, { band: pct, full: fullGuide, text });
     return text;
   };
 
@@ -2246,11 +2703,20 @@ export function apply(ctx, config) {
   // 动态提示走独立注入节点：与运行时上下文同构（durable user message），但自成一个 surface 节点，
   // 不与 cwd/文件策略合成同一条快照；文本按 5% 档缓存，档位没变就不追加。
   const lastHint = new Map(); // sessionId -> text
+  const lastSeqIndex = new Map(); // sessionId -> 上次注入的节点索引正文
   try {
     ctx.on('agent/pre-step', async (payload, next) => {
       const decision = await next();
       if (decision.kind === 'reject' || payload.signal?.aborted === true) return decision;
       const agent = payload.agent;
+      if (cfg.injectSeq) {
+        try {
+          installSeqTagger(agent?.session);
+        } catch (error) {
+          seqLog(`install failed: ${error.message}`);
+          ctx.logger?.warn?.(`context-compact: [#seq] 标记安装失败：${error.message}`);
+        }
+      }
       let text = '';
       try {
         text = renderDynamic(agent);
@@ -2259,17 +2725,28 @@ export function apply(ctx, config) {
       }
       if (text.length === 0) return decision;
       const sessionId = String(agent?.session?.id ?? '');
-      if (lastHint.get(sessionId) === text) return decision;
-      lastHint.set(sessionId, text);
+      const extra = [];
+      if (lastHint.get(sessionId) !== text) {
+        lastHint.set(sessionId, text);
+        extra.push(createUserMessage({
+          content: [{ type: 'text', text }],
+          source: { kind: 'context-compact-hint', form: 'snapshot' },
+        }));
+      }
+      if (cfg.injectSeqIndex) {
+        const index = buildSeqIndexText(agent.session, cfg);
+        if (index.length > 0 && lastSeqIndex.get(sessionId) !== index) {
+          lastSeqIndex.set(sessionId, index);
+          extra.push(createUserMessage({
+            content: [{ type: 'text', text: index }],
+            source: { kind: 'context-compact-seq', form: 'snapshot' },
+          }));
+        }
+      }
+      if (extra.length === 0) return decision;
       return {
         ...decision,
-        messages: [
-          ...decision.messages,
-          createUserMessage({
-            content: [{ type: 'text', text }],
-            source: { kind: 'context-compact-hint', form: 'snapshot' },
-          }),
-        ],
+        messages: [...decision.messages, ...extra],
       };
     });
   } catch (error) {

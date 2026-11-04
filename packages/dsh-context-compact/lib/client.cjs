@@ -403,7 +403,7 @@ window.__ModuleLoader__.load({
           h(
             'span',
             { className: 'ccc-th' },
-            '阈值',
+            '反思线',
             editing
               ? h('input', {
                   className: 'ccc-input ccc-input-num ccc-th-input',
@@ -426,7 +426,7 @@ window.__ModuleLoader__.load({
                 })
               : h(
                   'button',
-                  { type: 'button', className: 'ccc-th-val', onClick: begin, title: '点一下改阈值，回车保存' },
+                  { type: 'button', className: 'ccc-th-val', onClick: begin, title: '点一下改反思线（只是提醒线，不是压缩开关），回车保存' },
                   hasThreshold ? `${formatNum(threshold)}%` : '—',
                 ),
           ),
@@ -1728,7 +1728,7 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const saveThreshold = (value) => saveConfig({ promptThresholdPct: Number(value) }, `已保存，阈值 ${Math.round(Number(value))}%`)
+      const saveThreshold = (value) => saveConfig({ promptThresholdPct: Number(value) }, `已保存，反思线 ${Math.round(Number(value))}%`)
       const saveAction = (value) =>
         saveConfig(
           { triggerAction: String(value) },
