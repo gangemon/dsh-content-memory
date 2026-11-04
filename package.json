@@ -1,0 +1,13 @@
+{
+  "name": "dsh-content-memory",
+  "private": true,
+  "version": "0.0.0",
+  "description": "DeepSeek Harness 的上下文压缩插件仓库，插件本体在 packages/dsh-context-compact",
+  "license": "MIT",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "check": "node --check packages/dsh-context-compact/lib/index.js && node --check packages/dsh-context-compact/lib/client.cjs"
+  }
+}
